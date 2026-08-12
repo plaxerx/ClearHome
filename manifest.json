@@ -1,0 +1,105 @@
+{
+  "manifest_version": 3,
+  "name": "Clear Home",
+  "version": "1.4.2",
+  "description": "Instant pricing intelligence, risk flags, and action guidance on every real estate listing.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "tabs",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://api.openai.com/*",
+    "https://*.zillow.com/*",
+    "https://fred.stlouisfed.org/*",
+    "https://nominatim.openstreetmap.org/*",
+    "https://router.project-osrm.org/*",
+    "https://www.ocpafl.org/*",
+    "https://taxestimator.ocpafl.org/*",
+    "https://vgispublic.ocpafl.org/*",
+    "https://www.myfloridalicense.com/*",
+    "https://www2.myfloridalicense.com/*",
+    "https://www.stellarmls.com/*",
+    "https://search.orlandorealtors.com/*",
+    "https://www.floridarealtors.org/*",
+    "https://www.trec.texas.gov/*",
+    "https://www2.dre.ca.gov/*",
+    "https://data.ny.gov/*",
+    "https://dos.ny.gov/*",
+    "https://idfpr.illinois.gov/*",
+    "https://apps2.colorado.gov/*",
+    "https://red.nv.gov/*",
+    "https://secure.lni.wa.gov/*",
+    "https://services.azre.gov/*",
+    "https://verify.sos.ga.gov/*",
+    "https://licenseesearch.oregon.gov/*",
+    "https://www.pals.pa.gov/*",
+    "https://www.ncrec.gov/*",
+    "https://www.arello.com/*",
+    "https://www.realtor.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.zillow.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.zillow.com/*",
+        "https://*.redfin.com/*",
+        "https://*.realtor.com/*"
+      ],
+      "js": [
+        "scroll.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://*.zillow.com/*"
+      ],
+      "js": [
+        "search.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    }
+  ],
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icons/*.png"
+      ],
+      "matches": [
+        "https://*.zillow.com/*",
+        "https://*.redfin.com/*",
+        "https://*.realtor.com/*"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+# Chrome runs this folder directly; a zip is only ever made for a Web Store
+# upload and should never be committed or left in the tree.
+*.zip
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
+
+# OS / editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp

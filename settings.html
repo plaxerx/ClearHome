@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Clear Home Settings</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      /* ── LexiSwap light (blue/slate) ── */
+      --bg:       #ffffff;
+      --bg-2:     #f4f6fb;
+      --bg-3:     #e8edf9;
+      --border:   rgba(20,28,52,0.10);
+      --border-2: rgba(20,28,52,0.16);
+      --text-1:   #141821;
+      --text-2:   #3d465c;
+      --text-3:   #6b7488;
+      --text-4:   #a8b0c2;
+      --accent:   #4F6BFF;
+      --accent-l: #e7ebff;
+      --green:    #1FA968;
+      --red:      #E5544E;
+      --mono:     'IBM Plex Mono', ui-monospace, monospace;
+      --display:  'Bricolage Grotesque', 'Inter', sans-serif;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        /* ── LexiSwap ink/slate ── */
+        --bg:       #141821;
+        --bg-2:     #1b2230;
+        --bg-3:     #232c3e;
+        --border:   rgba(255,255,255,0.08);
+        --border-2: rgba(255,255,255,0.14);
+        --text-1:   #e9edf4;
+        --text-2:   #b4bccd;
+        --text-3:   #8a93a6;
+        --text-4:   #5a6276;
+        --accent:   #5C78FF;
+        --accent-l: #232c52;
+        --green:    #33C77F;
+        --red:      #E5544E;
+      }
+    }
+
+    body {
+      width: 300px;
+      background: var(--bg);
+      color: var(--text-1);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 13px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 15px 11px;
+      border-bottom: 0.5px solid var(--border);
+    }
+
+    .header-logo svg { color: var(--accent); }
+
+    .header-title {
+      font-family: var(--display);
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      text-transform: none;
+      color: var(--text-1);
+      flex: 1;
+    }
+
+    .header-version {
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--text-4);
+    }
+
+    .section {
+      padding: 12px 15px;
+      border-bottom: 0.5px solid var(--border);
+    }
+
+    .section-label {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--text-3);
+      margin-bottom: 9px;
+    }
+
+    /* Toggle switch */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .toggle-label { font-size: 12px; color: var(--text-2); }
+
+    .toggle-switch {
+      position: relative;
+      width: 34px;
+      height: 20px;
+    }
+
+    .toggle-switch input { opacity: 0; width: 0; height: 0; }
+
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      background: var(--border-2);
+      border-radius: 20px;
+      cursor: pointer;
+      transition: background 0.18s;
+    }
+
+    .toggle-track::after {
+      content: '';
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 14px;
+      height: 14px;
+      border-radius: 50%;
+      background: white;
+      transition: transform 0.18s;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+    }
+
+    .toggle-switch input:checked + .toggle-track { background: var(--accent); }
+    .toggle-switch input:checked + .toggle-track::after { transform: translateX(14px); }
+
+    /* API key input */
+    .key-wrap {
+      position: relative;
+    }
+
+    .key-input {
+      width: 100%;
+      font-family: var(--mono);
+      font-size: 10px;
+      padding: 8px 36px 8px 10px;
+      border: 0.5px solid var(--border-2);
+      border-radius: 8px;
+      background: var(--bg-2);
+      color: var(--text-1);
+      outline: none;
+      transition: border-color 0.12s;
+    }
+
+    .key-input::placeholder { color: var(--text-4); }
+    .key-input:focus { border-color: var(--accent); }
+
+    .key-eye {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: var(--text-3);
+      font-size: 12px;
+      padding: 0;
+      line-height: 1;
+    }
+
+    .key-status {
+      font-size: 10px;
+      margin-top: 5px;
+      color: var(--text-3);
+    }
+
+    .key-status.saved { color: var(--green); }
+    .key-status.error { color: var(--red); }
+
+    /* Theme selector */
+    .theme-options {
+      display: flex;
+      gap: 6px;
+    }
+
+    .theme-btn {
+      flex: 1;
+      font-family: -apple-system, sans-serif;
+      font-size: 10px;
+      padding: 6px 4px;
+      border: 0.5px solid var(--border-2);
+      border-radius: 7px;
+      background: var(--bg-2);
+      color: var(--text-2);
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.12s;
+    }
+
+    .theme-btn.active {
+      background: var(--accent-l);
+      color: var(--accent);
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+
+    .section-hint {
+      font-size: 10px;
+      color: var(--text-3);
+      margin-bottom: 10px;
+      line-height: 1.4;
+    }
+
+    .field-row {
+      margin-bottom: 9px;
+    }
+
+    .field-label {
+      display: block;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-3);
+      margin-bottom: 4px;
+    }
+
+    .input-prefix-wrap {
+      display: flex;
+      align-items: center;
+      border: 0.5px solid var(--border-2);
+      border-radius: 8px;
+      background: var(--bg-2);
+      overflow: hidden;
+      transition: border-color 0.12s, box-shadow 0.12s;
+    }
+    .input-prefix-wrap:focus-within {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-l);
+    }
+
+    .input-prefix {
+      padding: 6px 8px;
+      font-size: 11px;
+      color: var(--text-3);
+      background: var(--bg-3);
+      border-right: 0.5px solid var(--border);
+      font-family: var(--mono);
+    }
+
+    .field-input {
+      flex: 1;
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 6px 8px;
+      border: none;
+      background: transparent;
+      color: var(--text-1);
+      outline: none;
+      width: 100%;
+    }
+
+    /* Select dropdowns — force background + color to respect light/dark theme */
+    select.field-input {
+      background-color: var(--bg-2);
+      color: var(--text-1);
+      border: 0.5px solid var(--border-2);
+      border-radius: 8px;
+      cursor: pointer;
+      appearance: none;
+      padding-right: 22px;
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'><polyline points='2,4 5,7 8,4' fill='none' stroke='%236b7488' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+      background-repeat: no-repeat;
+      background-position: right 6px center;
+      background-size: 10px;
+      transition: border-color 0.12s, box-shadow 0.12s;
+    }
+    select.field-input option {
+      background-color: var(--bg);
+      color: var(--text-1);
+    }
+    select.field-input:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-l);
+    }
+
+    .field-input::placeholder { color: var(--text-4); }
+    .key-input:focus { box-shadow: 0 0 0 3px var(--accent-l); }
+
+    .field-hint {
+      font-size: 9px;
+      color: var(--text-4);
+      margin-top: 3px;
+    }
+
+    .profile-status {
+      font-size: 10px;
+      color: var(--text-3);
+      margin-top: 8px;
+    }
+    .profile-status.saved { color: var(--green); }
+
+    /* Housing priorities */
+    .priority-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .priority-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      padding: 5px 10px;
+      border: 1px solid var(--border-2);
+      border-radius: 20px;
+      background: var(--bg-2);
+      color: var(--text-2);
+      cursor: pointer;
+      transition: all 0.12s;
+      user-select: none;
+    }
+
+    .priority-chip:hover { border-color: var(--accent); color: var(--accent); }
+
+    .priority-chip.active {
+      background: var(--accent-l);
+      border-color: var(--accent);
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .priority-hint {
+      font-size: 9px;
+      color: var(--text-4);
+      margin-top: 7px;
+      line-height: 1.4;
+    }
+
+    /* Stats */
+    .stats-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .stat-card {
+      flex: 1;
+      background: var(--bg-2);
+      border-radius: 8px;
+      padding: 8px 10px;
+      text-align: center;
+    }
+
+    .stat-num {
+      font-family: var(--mono);
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-1);
+    }
+
+    .stat-label {
+      font-size: 9px;
+      color: var(--text-3);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-top: 2px;
+    }
+
+    .footer {
+      padding: 10px 15px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .footer-brand {
+      font-size: 10px;
+      color: var(--text-4);
+    }
+
+    .footer-links {
+      display: flex;
+      gap: 10px;
+    }
+
+    .footer-link {
+      font-size: 10px;
+      color: var(--text-3);
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .footer-link:hover { color: var(--accent); }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <svg width="20" height="20" viewBox="0 0 22 22" fill="none" style="color:var(--accent)">
+      <path d="M2.5 10.5L11 3L19.5 10.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M4.5 9V19H9V14H13V19H17.5V9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M9.8 16.6L10.8 17.8L12.8 15.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span class="header-title">Clear Home</span>
+    <span class="header-version">v1.2.0</span>
+  </div>
+
+  <!-- Enable toggle -->
+  <div class="section">
+    <div class="section-label">Extension</div>
+    <div class="toggle-row">
+      <span class="toggle-label">Enable Clear Home</span>
+      <label class="toggle-switch">
+        <input type="checkbox" id="toggle-enabled" checked>
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+  </div>
+
+  <!-- Mode Toggle -->
+  <div class="section">
+    <div class="section-label">Analysis Mode</div>
+    <div class="field-row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">Mode</label>
+        <div class="field-hint">Buyer mode analyzes listings for purchase. RealtorIQ is coming soon.</div>
+      </div>
+      <select class="field-input" id="analysis-mode" style="width:140px;" disabled>
+        <option value="buyer" selected>Buyer</option>
+        <option value="realtor" disabled>RealtorIQ (Soon)</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- AI Provider + API Key -->
+  <div class="section">
+    <div class="field-row" style="align-items:center;justify-content:space-between;margin-top:0;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">AI Provider</label>
+        <div class="field-hint">Use OpenAI or keep your existing Anthropic setup.</div>
+      </div>
+      <select class="field-input" id="ai-provider-select" style="width:auto;min-width:160px;">
+        <option value="openai">OpenAI</option>
+        <option value="anthropic">Anthropic</option>
+      </select>
+    </div>
+    <div class="section-label" id="api-key-label">OpenAI API Key</div>
+    <div class="key-wrap">
+      <input type="password" class="key-input" id="api-key-input" placeholder="sk-…">
+      <button class="key-eye" id="key-eye-btn" title="Show/hide">👁</button>
+    </div>
+    <div class="key-status" id="key-status">Enter your API key to enable AI analysis.</div>
+  </div>
+
+  <!-- Buyer Profile -->
+  <div class="section">
+    <div class="section-label">Your Buyer Profile</div>
+    <div class="section-hint">Used for affordability & DTI calculations on every listing.</div>
+
+    <div class="field-row">
+      <label class="field-label">Annual Household Income</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="annual-income" placeholder="120000" min="0" step="1000">
+      </div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Monthly Take-Home Pay</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="monthly-takehome" placeholder="7500" min="0" step="100">
+      </div>
+      <div class="field-hint">Your actual direct deposit total (after tax)</div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Current Monthly Housing Costs</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="monthly-housing" placeholder="1800" min="0" step="50">
+      </div>
+      <div class="field-hint">Current rent or mortgage payment</div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Current Monthly Utilities</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="monthly-utilities" placeholder="250" min="0" step="25">
+      </div>
+      <div class="field-hint">Electric, water, gas, internet, etc.</div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Non-Housing Monthly Debt Payments</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="monthly-debts" placeholder="500" min="0" step="50">
+      </div>
+      <div class="field-hint">Car, student loans, credit cards</div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Required Discretionary Spending</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="monthly-discretionary" placeholder="1500" min="0" step="100">
+      </div>
+      <div class="field-hint">Medical, food, daycare, gas — not in DTI but affects disposable income</div>
+    </div>
+
+    <div class="profile-status" id="profile-status">Profile not saved.</div>
+  </div>
+
+  <!-- Mortgage & Insurance -->
+  <div class="section">
+    <div class="section-label">Mortgage & Insurance</div>
+    <div class="section-hint">Used to calculate PITI and DTI for each listing.</div>
+
+    <div class="field-row">
+      <label class="field-label">Down Payment</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">%</span>
+        <input type="number" class="field-input" id="down-payment-pct" placeholder="20" min="3" max="100" step="1">
+      </div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Mortgage Rate</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">%</span>
+        <input type="number" class="field-input" id="mortgage-rate" placeholder="7.0" min="1" max="20" step="0.125">
+      </div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Insurance (% of price or flat $/mo)</label>
+      <div style="display:flex;gap:6px;">
+        <div class="input-prefix-wrap" style="flex:1;">
+          <span class="input-prefix">%</span>
+          <input type="number" class="field-input" id="insurance-pct" placeholder="0.35" min="0" max="5" step="0.05">
+        </div>
+        <span style="align-self:center;color:var(--text-4);font-size:10px;">or</span>
+        <div class="input-prefix-wrap" style="flex:1;">
+          <span class="input-prefix">$</span>
+          <input type="number" class="field-input" id="monthly-insurance" placeholder="150" min="0" step="10">
+        </div>
+      </div>
+      <div class="field-hint">% of purchase price per year is preferred; flat $/mo used as fallback</div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Homestead Exemption</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="homestead-exemption" placeholder="50000" min="0" step="1000">
+      </div>
+      <div class="field-hint">Assessed-value reduction for a primary residence (e.g. FL $50,000). Reduces taxable value against the Clear Home offer. Ignored for investment properties.</div>
+    </div>
+
+    <div class="field-row">
+      <label class="field-label">Transfer / Portability Exemption</label>
+      <div class="input-prefix-wrap">
+        <span class="input-prefix">$</span>
+        <input type="number" class="field-input" id="transfer-exemption" placeholder="0" min="0" step="1000">
+      </div>
+      <div class="field-hint">Assessed-value credit you expect to carry over from a prior home (portability, available in some states). Also reduces taxable value against the Clear Home offer. Ignored for investment properties.</div>
+    </div>
+  </div>
+
+  <!-- Analysis Preferences -->
+  <div class="section">
+    <div class="section-label">Analysis Preferences</div>
+    <div class="section-hint">Customize how Clear Home runs your analysis.</div>
+
+    <div class="field-row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">AI Model</label>
+        <div class="field-hint" id="ai-model-hint">Choose a quality/cost tier for the selected provider.</div>
+      </div>
+      <select class="field-input" id="ai-model-select" style="width:auto;min-width:160px;">
+        <option value="gpt-5.6-terra">GPT-5.6 Terra</option>
+        <option value="gpt-5.6-sol">GPT-5.6 Sol</option>
+        <option value="gpt-5.6-luna">GPT-5.6 Luna</option>
+      </select>
+    </div>
+
+    <div class="field-row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">Analysis Effort</label>
+        <div class="field-hint">Low is faster & cheaper, plenty for most listings · High reasons more on tricky ones (Sonnet 5 / Opus 4.7+ only)</div>
+      </div>
+      <select class="field-input" id="ai-effort-select" style="width:auto;min-width:160px;">
+        <option value="low">Low (fast)</option>
+        <option value="medium">Medium</option>
+        <option value="high">High (thorough)</option>
+      </select>
+    </div>
+
+    <div class="field-row" id="ai-fast-mode-row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">OpenAI Fast Mode</label>
+        <div class="field-hint">Same selected model and reasoning quality, with prioritized processing. Uses premium token pricing and falls back automatically if unavailable.</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" id="ai-fast-mode-toggle" checked>
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      </label>
+    </div>
+
+    <div class="field-row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">Price Reality Check Mode</label>
+        <div class="field-hint">What to show as the benchmark price range</div>
+      </div>
+      <select class="field-input" id="price-check-mode" style="width:auto;min-width:160px;">
+        <option value="fair_value">Fair Value</option>
+        <option value="sales_range">Sales Range</option>
+      </select>
+    </div>
+
+    <div class="field-row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">Offer Strategy</label>
+        <div class="field-hint">How aggressive the Clear Home offer should be</div>
+      </div>
+      <select class="field-input" id="offer-strategy" style="width:auto;min-width:160px;">
+        <option value="aggressive">Market Bottom (aggressive)</option>
+        <option value="competitive" selected>Competitive (fair, ~5% off)</option>
+      </select>
+    </div>
+
+    <div class="field-row" style="align-items:center;justify-content:space-between;">
+      <div>
+        <label class="field-label" style="margin-bottom:2px;">Flood Insurance Estimate</label>
+        <div class="field-hint">Show estimated cost when property is in a flood zone</div>
+      </div>
+      <label class="toggle-switch">
+        <input type="checkbox" id="flood-insurance-toggle">
+        <span class="toggle-track"><span class="toggle-thumb"></span></span>
+      </label>
+    </div>
+  </div>
+
+  <!-- Commute Addresses -->
+  <div class="section">
+    <div class="section-label">Commute Addresses</div>
+    <div class="section-hint">Estimated commute times will appear in your analysis for each saved address.</div>
+
+    <div class="field-row">
+      <label class="field-label">Workplace 1</label>
+      <input type="text" class="field-input" id="commute-work1-label" placeholder="Label (e.g. Mom's Office)" style="width:110px;margin-right:6px;">
+      <input type="text" class="field-input" id="commute-work1-addr" placeholder="Address or city" style="flex:1;">
+    </div>
+    <div class="field-row">
+      <label class="field-label">Workplace 2</label>
+      <input type="text" class="field-input" id="commute-work2-label" placeholder="Label (e.g. Dad's Office)" style="width:110px;margin-right:6px;">
+      <input type="text" class="field-input" id="commute-work2-addr" placeholder="Address or city" style="flex:1;">
+    </div>
+    <div class="field-row">
+      <label class="field-label">Flex 1</label>
+      <input type="text" class="field-input" id="commute-flex1-label" placeholder="Label (e.g. School)" style="width:110px;margin-right:6px;">
+      <input type="text" class="field-input" id="commute-flex1-addr" placeholder="Address or city" style="flex:1;">
+    </div>
+    <div class="field-row">
+      <label class="field-label">Flex 2</label>
+      <input type="text" class="field-input" id="commute-flex2-label" placeholder="Label (e.g. Grandparents)" style="width:110px;margin-right:6px;">
+      <input type="text" class="field-input" id="commute-flex2-addr" placeholder="Address or city" style="flex:1;">
+    </div>
+    <div class="field-row">
+      <label class="field-label">Flex 3</label>
+      <input type="text" class="field-input" id="commute-flex3-label" placeholder="Label (e.g. Gym)" style="width:110px;margin-right:6px;">
+      <input type="text" class="field-input" id="commute-flex3-addr" placeholder="Address or city" style="flex:1;">
+    </div>
+    <div class="profile-status" id="commute-status">Addresses not saved.</div>
+  </div>
+
+  <!-- Housing Priorities -->
+  <div class="section">
+    <div class="section-label">Housing Priorities</div>
+    <div class="section-hint">Select what matters most — risks and opportunities will be weighted accordingly.</div>
+    <div class="priority-grid" id="priority-grid">
+      <button class="priority-chip" data-priority="schools">🎓 Schools</button>
+      <button class="priority-chip" data-priority="safety">🛡 Safety</button>
+      <button class="priority-chip" data-priority="walkability">🚶 Walkability</button>
+      <button class="priority-chip" data-priority="hoa">🏘 Low/No HOA</button>
+      <button class="priority-chip" data-priority="investment">📈 Investment</button>
+      <button class="priority-chip" data-priority="commute">🚗 Commute</button>
+      <button class="priority-chip" data-priority="new_construction">🏗 New Build</button>
+      <button class="priority-chip" data-priority="outdoor">🌳 Outdoor Space</button>
+    </div>
+    <div class="priority-hint">Selected priorities raise risk severity for related issues. E.g. Schools selected → low school rating becomes a high-severity risk.</div>
+  </div>
+
+  <!-- Theme -->
+  <div class="section">
+    <div class="section-label">Theme</div>
+    <div class="theme-options">
+      <button class="theme-btn" data-theme="system">System</button>
+      <button class="theme-btn" data-theme="light">Light</button>
+      <button class="theme-btn" data-theme="dark">Dark</button>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="section">
+    <div class="section-label">Session Stats</div>
+    <div class="stats-row">
+      <div class="stat-card">
+        <div class="stat-num" id="stat-listings">0</div>
+        <div class="stat-label">Listings Viewed</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-num" id="stat-analyses">0</div>
+        <div class="stat-label">Analyses Run</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <span class="footer-brand">Clear Home · Real Estate Intel</span>
+    <div class="footer-links">
+      <a class="footer-link" id="clear-stats-btn">Clear Stats</a>
+    </div>
+  </div>
+
+  <script src="settings.js"></script>
+</body>
+</html>
