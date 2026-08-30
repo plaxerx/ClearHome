@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clear Home</title>
+<style>
+
+  :root {
+    --bg:           #ffffff;
+    --bg-2:         #f4f6fb;
+    --bg-3:         #e8edf9;
+    --border:       rgba(20,28,52,0.10);
+    --border-2:     rgba(20,28,52,0.16);
+    --text-1:       #141821;
+    --text-2:       #3d465c;
+    --text-3:       #6b7488;
+    --text-4:       #a8b0c2;
+    --accent:       #4F6BFF;
+    --accent-light: #e7ebff;
+    --red:          #E5544E;
+    --red-bg:       #fdeceb;
+    --red-text:     #b13731;
+    --display:      'Bricolage Grotesque', 'Inter', sans-serif;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:           #141821;
+      --bg-2:         #1b2230;
+      --bg-3:         #232c3e;
+      --border:       rgba(255,255,255,0.08);
+      --border-2:     rgba(255,255,255,0.14);
+      --text-1:       #e9edf4;
+      --text-2:       #b4bccd;
+      --text-3:       #8a93a6;
+      --text-4:       #5a6276;
+      --accent:       #5C78FF;
+      --accent-light: #232c52;
+      --red:          #E5544E;
+      --red-bg:       #2e1413;
+      --red-text:     #ff8a85;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg:           #141821;
+    --bg-2:         #1b2230;
+    --bg-3:         #232c3e;
+    --border:       rgba(255,255,255,0.08);
+    --border-2:     rgba(255,255,255,0.14);
+    --text-1:       #e9edf4;
+    --text-2:       #b4bccd;
+    --text-3:       #8a93a6;
+    --text-4:       #5a6276;
+    --accent:       #5C78FF;
+    --accent-light: #232c52;
+    --red:          #E5544E;
+    --red-bg:       #2e1413;
+    --red-text:     #ff8a85;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text-1);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  #ch-sp {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
+
+  .sp-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 0.5px solid var(--border-2);
+    flex-shrink: 0;
+  }
+
+  .sp-brand {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: -0.01em;
+    margin-right: auto;
+  }
+
+  .sp-iconbtn {
+    border: none;
+    background: transparent;
+    color: var(--text-3);
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    transition: background .15s, color .15s;
+  }
+  .sp-iconbtn:hover { background: var(--accent-light); color: var(--accent); }
+
+  .sp-view { display: none; flex: 1 1 auto; min-height: 0; }
+  .sp-view.active { display: flex; flex-direction: column; }
+
+  #ch-analysis-root {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 0;
+  }
+
+  .sp-empty {
+    padding: 28px 20px;
+    color: var(--text-3);
+    text-align: center;
+  }
+  .sp-empty h2 {
+    font-family: var(--display);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-1);
+    margin: 0 0 6px;
+  }
+  .sp-empty p { margin: 0; font-size: 12px; }
+
+  .sp-listing {
+    margin: 14px;
+    padding: 14px;
+    border: 0.5px solid var(--border-2);
+    border-radius: 12px;
+    background: var(--bg);
+    box-shadow: 0 1px 3px rgba(20,28,52,0.06);
+  }
+  .sp-listing-addr {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-1);
+    margin-bottom: 10px;
+    line-height: 1.35;
+  }
+  .sp-offmarket {
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--text-4);
+  }
+  .sp-run-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: 100%;
+    border: none;
+    border-radius: 9px;
+    padding: 10px 12px;
+    background: var(--accent);
+    color: #fff;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: filter .15s;
+  }
+  .sp-run-btn:hover:not(:disabled) { filter: brightness(1.06); }
+  .sp-run-btn:disabled { opacity: .6; cursor: default; }
+  .sp-listing-note {
+    margin-top: 8px;
+    font-size: 10.5px;
+    color: var(--text-4);
+    text-align: center;
+  }
+
+  .sp-progress { margin: 0 14px 14px; }
+  .sp-progress-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--text-2);
+    margin-bottom: 8px;
+  }
+  .sp-spinner {
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    border: 1.6px solid var(--bg-3);
+    border-top-color: var(--accent);
+    animation: sp-spin .7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes sp-spin { to { transform: rotate(360deg); } }
+
+  .sp-activity {
+    max-height: 168px;
+    overflow-y: auto;
+    border-left: 2px solid var(--bg-3);
+    padding-left: 10px;
+  }
+  .sp-activity-item {
+    font-size: 11px;
+    color: var(--text-3);
+    padding: 2.5px 0;
+    animation: sp-fade .25s ease;
+  }
+  .sp-activity-item:last-child { color: var(--text-1); font-weight: 500; }
+  @keyframes sp-fade { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
+
+  .sp-error {
+    margin: 14px;
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: var(--red-bg);
+    color: var(--red-text);
+    font-size: 12px;
+  }
+  .sp-error-actions { margin-top: 10px; display: flex; gap: 8px; }
+  .sp-btn-small {
+    border: 0.5px solid var(--border-2);
+    background: var(--bg);
+    color: var(--text-2);
+    border-radius: 7px;
+    padding: 5px 10px;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .sp-btn-small:hover { border-color: var(--accent); color: var(--accent); }
+
+  #sp-toast {
+    position: fixed;
+    left: 50%;
+    bottom: 16px;
+    transform: translateX(-50%);
+    background: var(--bg-3);
+    color: var(--text-1);
+    border: 0.5px solid var(--border-2);
+    padding: 8px 14px;
+    border-radius: 8px;
+    font-size: 11.5px;
+    font-weight: 600;
+    max-width: 90%;
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s;
+    z-index: 50;
+  }
+  #sp-toast.show { opacity: 1; }
+
+  #ch-settings-frame {
+    flex: 1 1 auto;
+    width: 100%;
+    border: none;
+    display: block;
+  }
+
+  #ch-panel {
+    width: 100% !important;
+    max-height: none !important;
+    overflow: visible !important;
+    opacity: 1 !important;
+    transform: none !important;
+    border: none !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+
+    pointer-events: auto !important;
+  }
+
+  #ch-panel #ch-activity { display: none !important; }
+</style>
+</head>
+<body>
+  <div id="ch-sp">
+    <div class="sp-header">
+      <span class="sp-brand">Clear Home</span>
+      <button class="sp-iconbtn" id="sp-settings-btn" title="Settings">Settings</button>
+      <button class="sp-iconbtn" id="sp-back-btn" title="Back" style="display:none;">Back</button>
+    </div>
+
+    <div class="sp-view active" id="sp-view-analysis">
+      <div id="ch-analysis-root">
+        <div class="sp-empty" id="sp-empty">
+          <h2>No listing open</h2>
+          <p>Open a home on Zillow to analyze it here.</p>
+        </div>
+
+        <div class="sp-listing" id="sp-listing" style="display:none;">
+          <div class="sp-listing-addr" id="sp-listing-addr"></div>
+          <button class="sp-run-btn" id="sp-run-btn">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <circle cx="7" cy="7" r="6.5" stroke="currentColor" stroke-opacity="0.4"/>
+              <polygon points="5.5,4.5 10,7 5.5,9.5" fill="currentColor"/>
+            </svg>
+            <span id="sp-run-label">Analyze Listing</span>
+          </button>
+          <div class="sp-listing-note" id="sp-listing-note"></div>
+        </div>
+
+        <div class="sp-progress" id="sp-progress" style="display:none;">
+          <div class="sp-progress-head">
+            <span class="sp-spinner"></span>
+            <span id="sp-progress-status">Working…</span>
+          </div>
+          <div class="sp-activity" id="sp-activity"></div>
+        </div>
+
+        <div class="sp-error" id="sp-error" style="display:none;">
+          <div id="sp-error-msg"></div>
+          <div class="sp-error-actions">
+            <button class="sp-btn-small" id="sp-retry-btn">Try again</button>
+            <button class="sp-btn-small" id="sp-error-settings-btn">Settings</button>
+          </div>
+        </div>
+
+        <div id="sp-result"></div>
+      </div>
+    </div>
+
+    <div class="sp-view" id="sp-view-settings">
+      <iframe id="ch-settings-frame" src="settings.html" title="Clear Home settings"></iframe>
+    </div>
+  </div>
+  <div id="sp-toast"></div>
+  <script src="sidepanel.js"></script>
+</body>
+</html>

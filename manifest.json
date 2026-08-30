@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Clear Home",
-  "version": "1.4.2",
+  "version": "1.4.6",
   "description": "Instant pricing intelligence, risk flags, and action guidance on every real estate listing.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
     "tabs",
-    "downloads"
+    "downloads",
+    "sidePanel"
   ],
   "host_permissions": [
     "https://api.anthropic.com/*",
@@ -43,6 +44,9 @@
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
   },
   "content_scripts": [
     {

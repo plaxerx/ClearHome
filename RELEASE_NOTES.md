@@ -1,3 +1,54 @@
+# Clear Home 1.4.6 release notes
+
+## Fixed
+
+- **Analyses survive now.** Printing to PDF and closing the tab used to throw away the analysis you paid for: switching away from the listing tab told the panel there was no listing, and it cleared the results. Finished analyses are saved and restored, so they survive a tab switch, closing the panel, and a browser restart. The last eight are kept, keyed by listing.
+- **"Show more" on comparable sales works.** The button used an inline `onclick`, which an extension page's content security policy blocks. It is wired up in the panel now. It also said "Show N more" with the count one too low.
+
+---
+
+# Clear Home 1.4.5 release notes
+
+## Fixed
+
+- **The listing card could show a different home's address.** 1.4.4 read the first `streetAddress` it found in Zillow's page data, which also contains nearby homes, comps, and recommendations — on the 9560 Bolero Rd listing it showed a neighbouring property. The address now comes from the `/homedetails/` URL, which is the only source guaranteed to describe the home you are looking at. The page title is still preferred for its formatting, but only when it agrees with that URL.
+
+---
+
+# Clear Home 1.4.4 release notes
+
+Version 1.4.4 fixes three things reported against the 1.4.3 side panel.
+
+## Fixed
+
+- **Nothing in the analysis was clickable.** Print, Download Logs, and the section expanders rendered but ignored clicks. The analysis stylesheet holds the panel at `pointer-events: none` until it gets the `visible` class, which used to be added by the popup's entry animation; the side panel now sets it, and the panel's own stylesheet guarantees interactivity regardless.
+- **The panel chrome stayed light while the analysis went dark.** The analysis follows the system colour scheme on its own, so the header, listing card, and progress feed disagreed with it. The shell now carries the same ink/slate palette, and an explicit Light or Dark choice in Settings applies to both.
+- **The listing card sometimes showed the search headline** ("Winter Garden FL Real Estate — …") instead of the address. The page title is only used when it reads like a street address; otherwise the card says "Detecting address…" and keeps looking as the page settles.
+
+---
+
+# Clear Home 1.4.3 release notes
+
+Version 1.4.3 moves Clear Home out of the web page. Everything now lives in the Chrome side panel.
+
+## The panel moved
+
+- **The floating card on the listing is gone.** Nothing is mounted in the Zillow page any more. Click the Clear Home icon to open the side panel; click it again to close it.
+- The side panel names the home you have open and holds the Analyze button, the progress feed, the finished analysis, Print, Download Logs, and the Mortgage Rate Lab.
+- The analysis reads the same as before. The content script still does the scraping, the provider call, and every number; it renders the panel and hands it to the side panel to display.
+- Settings opens inside the side panel instead of a new tab.
+
+## Settings
+
+- **The AI Model dropdown is gone.** Picking a provider picks the model: Anthropic runs Sonnet 5, OpenAI runs GPT-5.6 Terra.
+
+## Price cuts
+
+- The Price Cuts Only bar and the All Cuts panel use the same light blue-and-slate scheme as the side panel. They were still dark against Zillow's white chrome.
+- The price-cut tools now appear on searches for hyphenated cities. `isSearchPage()` only matched single-word city names, so `/Winter-Garden-FL/` and `/Haines-City-FL/` silently had no bar.
+
+---
+
 # Clear Home 1.4.2 release notes
 
 Version 1.4.2 trims the panel to what actually works and takes the machine out of the copy.

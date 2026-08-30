@@ -2,8 +2,10 @@
 # upload and should never be committed or left in the tree.
 *.zip
 
-# Local Claude Code settings (machine-specific)
-.claude/settings.local.json
+# AI process files. Agent instructions, transcripts, and scratch stay local -
+# nothing that is not a product asset belongs in this repository.
+CLAUDE.md
+.claude/
 
 # OS / editor noise
 Thumbs.db

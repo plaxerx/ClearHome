@@ -1,25 +1,21 @@
 
-// Clear Home — Content Script v1.0.0
 
 let homePanel        = null;
-let panelHost        = null;
+let chPanelRoot      = null;
+let chRateLabCtx     = null;   
 let clearHomeEnabled = true;
 let currentTheme     = 'system';
 let lastAnalyzedUrl  = '';
 let analysisInProgress = false;
-let scrollingInProgress = false; // blocks resetState during page expansion
-let analysisAbortKey = 0; // incremented on each navigation to invalidate stale responses
+let scrollingInProgress = false; 
+let analysisAbortKey = 0; 
 
-// ── Diagnostic logging (for "Download Logs") ──────────────────────────────────
-// A rolling in-memory buffer of timestamped events plus the most recent analysis
-// inputs/outputs, so value bugs can be diagnosed from a real export rather than
-// guesswork. Capped to avoid unbounded growth.
 const CH_LOG_MAX = 300;
 let chDiagLog = [];
-let chLastResult = null;     // last AI/JS analysis result object
-let chLastScraped = null;    // last scraped listingData
-let chLastRawResponse = null; // last raw API response text (pre-processing) — for logs
-let chAnalysisEffort = 'low'; // Sonnet 5+ effort level for the analysis call (user pref)
+let chLastResult = null;     
+let chLastScraped = null;    
+let chLastRawResponse = null; 
+let chAnalysisEffort = 'low'; 
 function chLog(tag, detail) {
   try {
     const entry = { t: new Date().toISOString(), tag, detail: detail ?? null };
@@ -27,32 +23,55 @@ function chLog(tag, detail) {
     if (chDiagLog.length > CH_LOG_MAX) chDiagLog.shift();
   } catch (e) {}
 }
-// Capture uncaught errors and promise rejections into the log
 try {
   self.addEventListener?.('error', (e) => chLog('window.error', { message: e.message, src: e.filename, line: e.lineno, col: e.colno }));
   self.addEventListener?.('unhandledrejection', (e) => chLog('unhandledrejection', { reason: String(e.reason).slice(0, 500) }));
 } catch (e) {}
 
 
-// ── Full state reset — called on every URL change ─────────────────────────────
+function sendToPanel(msg) {
+  try { chrome.runtime.sendMessage({ type: 'CH_TO_PANEL', payload: msg })?.catch?.(() => {}); } catch (e) {}
+}
+
+function chZpid() {
+  const m = location.pathname.match(/\/(\d+)_zpid/);
+  return m ? m[1] : '';
+}
+
+function pushPanel() {
+  if (!chPanelRoot) return;
+  sendToPanel({
+    type:   'CH_PANEL_HTML',
+    html:   chPanelRoot.innerHTML,
+    styles: getPanelStyles(),
+    theme:  currentTheme,
+    zpid:   chZpid(),
+    url:    location.href,
+  });
+}
+
+function rateLabRecompute(rate) {
+  if (!chRateLabCtx) return null;
+  const { barPrice, takehome, utilEst, debts, discretionary } = chRateLabCtx;
+  const piti = calcPITIBreakdown(barPrice, Number(rate)).total;
+  return { rate: Number(rate), piti, left: takehome - piti - utilEst - debts - discretionary };
+}
+
 function resetState() {
-  if (scrollingInProgress) return; // scroll in progress — do not interrupt
+  if (scrollingInProgress) return; 
   analysisAbortKey++;
   analysisInProgress = false;
   lastAnalyzedUrl    = '';
   stopCanvasSpinner();
   _activityTimers.forEach(clearTimeout);
   _activityTimers = [];
-  if (panelHost) {
-    try { panelHost.shadowRoot?.innerHTML && (panelHost.shadowRoot.innerHTML = ''); } catch(e) {}
-    panelHost.remove();
-    panelHost = null;
-    homePanel = null;
-  }
+  chPanelRoot  = null;
+  homePanel    = null;
+  chRateLabCtx = null;
   document.querySelectorAll('#clear-home-host').forEach(el => el.remove());
+  sendToPanel({ type: 'CH_RESET' });
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
 chrome.runtime.sendMessage({ type: 'GET_ENABLED' }).then(r => {
   clearHomeEnabled = r?.enabled !== false;
   if (clearHomeEnabled) maybeAnalyze();
@@ -63,18 +82,30 @@ chrome.runtime.sendMessage({ type: 'GET_THEME' }).then(r => {
   applyTheme(currentTheme);
 }).catch(() => {});
 
-// Listen for setting changes
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'TOGGLE_PANEL') {
-    if (panelHost) {
-      // Panel exists (maybe hidden) — slide it back in
-      const panel = panelHost.shadowRoot?.querySelector('#ch-panel');
-      if (panel) panel.classList.add('visible');
-    } else if (isListingPage()) {
-      // Panel was closed — recreate it
-      showManualTrigger();
-    }
+  if (msg.type === 'CH_REQUEST_LISTING') {
+    announceListing();
     sendResponse && sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === 'CH_RUN_ANALYSIS') {
+    runManualAnalysis();
+    sendResponse && sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === 'CH_PRINT') {
+    if (chPanelRoot) printAnalysis(chPanelRoot, chLastScraped || {});
+    sendResponse && sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === 'CH_DOWNLOAD_LOGS') {
+    try { downloadDiagnosticLogs(chLastScraped || {}); }
+    catch (err) { chToast('Log export failed — ' + (err?.message || err)); }
+    sendResponse && sendResponse({ ok: true });
+    return true;
+  }
+  if (msg.type === 'CH_RATE_CHANGE') {
+    sendResponse && sendResponse(rateLabRecompute(msg.rate));
     return true;
   }
   if (msg.type === 'SETTINGS_CHANGED') {
@@ -82,18 +113,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     currentTheme     = msg.theme     !== undefined ? msg.theme  : currentTheme;
     if (homePanel) applyTheme(currentTheme);
     if (clearHomeEnabled && !analysisInProgress) maybeAnalyze();
-    if (!clearHomeEnabled && panelHost) panelHost.remove();
+    if (!clearHomeEnabled) { chPanelRoot = null; sendToPanel({ type: 'CH_RESET' }); }
   }
   if (msg.type === 'PRIORITIES_CHANGED') {
-    // Priorities saved — no immediate action needed, picked up on next analysis
   }
   if (msg.type === 'PROFILE_CHANGED') {
-    // Profile changed — if panel is open and showing results, re-analyze
-    // (don't auto-trigger, user can reload)
   }
 });
 
-// ── URL change detection — MutationObserver + History API hooks ───────────────
 let lastUrl = location.href;
 
 function handleUrlChange() {
@@ -104,25 +131,18 @@ function handleUrlChange() {
   }
 }
 
-// MutationObserver catches DOM-level navigation
 const urlObserver = new MutationObserver(handleUrlChange);
 urlObserver.observe(document.body, { childList: true, subtree: true });
 
-// History API hooks catch pushState / replaceState (SPA routing)
 const _pushState    = history.pushState.bind(history);
 const _replaceState = history.replaceState.bind(history);
 history.pushState    = function(...a) { _pushState(...a);    setTimeout(handleUrlChange, 50); };
 history.replaceState = function(...a) { _replaceState(...a); setTimeout(handleUrlChange, 50); };
 window.addEventListener('popstate', () => setTimeout(handleUrlChange, 50));
 
-// ── Check if current page is a listing ───────────────────────────────────────
 function isListingPage() {
   const url      = location.href;
   const hostname = location.hostname;
-  // Zillow-only: /homedetails/ is the definitive URL pattern for any single-property
-  // page (for sale, sold, rental, showcase — they all use /homedetails/).
-  // We deliberately do NOT match /homes/, /b/, or /_zpid/ without /homedetails/
-  // to avoid triggering on search results and map pages.
   if (hostname.includes('zillow.com'))   return /\/homedetails\//.test(url);
   return false;
 }
@@ -131,7 +151,6 @@ function detectSite() {
   return 'Zillow';
 }
 
-// ── DOM scrapers ──────────────────────────────────────────────────────────────
 async function scrapeListing() {
   const site = detectSite();
   let data = {
@@ -139,12 +158,11 @@ async function scrapeListing() {
     isFSBO: false,
     address: '',
     price: 0,
-    rentPrice: 0,   // LOCKED: monthly rent from DOM quick scrape — never overwritten by sale price
+    rentPrice: 0,   
     sqft: 0,
     beds: 0,
     baths: 0,
     description: '',
-    // Extended fields
     agentName: '',
     agentPhone: '',
     brokerageName: '',
@@ -154,10 +172,10 @@ async function scrapeListing() {
     lotSize: '',
     propertyType: '',
     hoaFee: '',
-    taxHistory: [],       // [{year, amount}]
-    priceHistory: [],     // [{date, price, event}]
-    propertyDetails: {},  // key→value map of all facts
-    listingMode: 'buy',    // 'buy' | 'sold' | 'rent'
+    taxHistory: [],       
+    priceHistory: [],     
+    propertyDetails: {},  
+    listingMode: 'buy',    
     homeStatus: '',
     rentZestimate: 0,
     rentZestimateRange: null,
@@ -197,11 +215,6 @@ async function scrapeListing() {
     data = scrapeRealtor(data);
   }
 
-  // ── FINAL agent stamp (Zillow) ─────────────────────────────────────────────
-  // Last step, after everything else: fill the agent from (1) the sessionStorage
-  // bank (written the instant the attribution was EVER seen), then (2) a direct
-  // parse of the bottom-of-page snapshots the scroll already took. Nothing runs
-  // after this, so the value cannot be lost again.
   if (site === 'Zillow' && !data.isFSBO) {
     try {
       const bank = chReadAgent();
@@ -221,7 +234,7 @@ async function scrapeListing() {
     } catch (e) {}
   }
 
-  lastScrapedData = data; // cache for future features
+  lastScrapedData = data; 
   return data;
 }
 
@@ -230,7 +243,6 @@ function parseNum(str) {
   return parseFloat(str.replace(/[^0-9.]/g, '')) || 0;
 }
 
-// ── Zillow __NEXT_DATA__ extractor (primary source) ──────────────────────────
 function extractZillowNextData() {
   try {
     const el = document.getElementById('__NEXT_DATA__');
@@ -238,21 +250,17 @@ function extractZillowNextData() {
     const json  = JSON.parse(el.textContent);
     const props = json?.props?.pageProps;
 
-    // Get the zpid from the URL — our ground truth anchor
     const zpidM  = location.pathname.match(/\/(\d+)_zpid/);
     const urlZpid = zpidM ? zpidM[1] : null;
 
-    // Path 1: gdpClientCache — try key matching the zpid first
     const gdp = props?.gdpClientCache;
     if (gdp) {
       const keys = Object.keys(gdp);
-      // Prefer the key that contains our zpid
       const matchingKey = urlZpid ? keys.find(k => k.includes(urlZpid)) : null;
       const tryKey = (key) => {
         try {
           const inner = JSON.parse(gdp[key]);
           const data  = inner?.property || inner?.gdp || inner;
-          // Validate it's our listing
           if (data && (!urlZpid || !data.zpid || String(data.zpid) === urlZpid)) {
             if (data?.price || data?.listPrice || data?.zpid || data?.address) return data;
           }
@@ -263,13 +271,11 @@ function extractZillowNextData() {
       if (result) return result;
     }
 
-    // Path 2: aboveTheFold (Showcase listings)
     const atf = props?.aboveTheFold?.homeData || props?.aboveTheFold;
     if (atf && (!urlZpid || !atf.zpid || String(atf.zpid) === urlZpid)) {
       if (atf?.price || atf?.listPrice || atf?.address) return atf;
     }
 
-    // Path 3: direct pageProps fields
     const direct = props?.listing || props?.property || props?.homeDetails;
     if (direct) return direct;
 
@@ -279,48 +285,26 @@ function extractZillowNextData() {
   }
 }
 
-// ── Full page text extractor — scrapes ALL visible sections ──────────────────
 function extractFullPageText() {
   try {
-    // Clone and strip noise elements, then get text content
     const clone = document.body.cloneNode(true);
     clone.querySelectorAll('script, style, noscript, nav, header').forEach(el => el.remove());
-    // textContent works on detached nodes; innerText requires layout and may fail
     const txt = clone.textContent || clone.innerText || '';
     return txt;
   } catch(e) {
-    // Direct fallback — no cloning
     return document.body?.innerText || document.body?.textContent || '';
   }
 }
 
-// ── Nearby schools (GreatSchools) text parser ───────────────────────────────────
-// Zillow renders each school as:
-//   <Name>
-//   Grades PK-5 • 0.2 miles
-//   6/10
-//   GreatSchools® Rating
-//   Test Score Rating 7/10
-//   Student Progress Rating 5/10
-// The rating (N/10) comes AFTER the name + "Grades … • … miles" line, and the
-// distance lives on that Grades line (there is no "Distance:" label). Earlier
-// scrapers wrongly expected the rating FIRST and a "Distance:" label, so schools
-// were missed on virtually every listing. This parser anchors on the distinctive
-// "Grades <g> • <dist> miles <rating>/10" run and works whether the page text has
-// newlines (document.body.innerText) or is fully concatenated (textContent).
 function parseSchoolsFromText(text) {
   const out = [];
   if (!text || typeof text !== 'string') return out;
-  // Bound to the "Nearby schools" region so stray "Grades"/"miles" elsewhere don't match
   const secM = text.match(/Nearby schools[\s\S]{0,1500}?(?:More about schools|More school details|Skip carousel|Nearby homes|Local experts|$)/i);
   const region = secM ? secM[0] : text;
-  // Consume the whole entry (incl. the two sub-ratings when present) so the NEXT
-  // entry's name starts clean instead of swallowing the previous entry's tail.
   const re = /([A-Za-z][^\n]{1,70}?)\s*Grades?\s+([A-Za-z0-9\-]{1,8})\s*[•·∙]\s*([\d.]+)\s*mi(?:les)?\s*(\d{1,2})\s*\/\s*10\s*(?:GreatSchools®?\s*Rating)?\s*(?:Test Score Rating\s*\d{1,2}\s*\/\s*10)?\s*(?:Student Progress Rating\s*\d{1,2}\s*\/\s*10)?/gi;
   let m;
   while ((m = re.exec(region)) !== null) {
     let name = (m[1] || '').trim();
-    // Strip any header / previous-entry tail swept into the lazy name capture
     name = name.replace(/.*GreatSchools®?\s*Rating?/is, '')
                .replace(/.*GreatSchools®?/is, '')
                .replace(/^\s*Source:?\s*/i, '')
@@ -334,55 +318,45 @@ function parseSchoolsFromText(text) {
   return out;
 }
 
-// ── Photo extractor ───────────────────────────────────────────────────────────
-// Cache the most recent scraped listing data for reuse across panel actions
 let lastScrapedData = null;
 
 function extractPhotos() {
   const photos = [];
   const seen = new Set();
 
-  // Strategy 1: First large property image in the carousel/hero area
-  // Try multiple selectors covering regular, Showcase, and redesigned layouts
   const heroSelectors = [
     '[data-testid="media-stream"] img',
     '[class*="media-stream"] img',
-    '[data-testid="hollywood-image"] img',      // Showcase hero
-    '[class*="Showcase"] img',                   // Showcase container
-    '[class*="carousel"] img',                   // Generic carousel
-    '[class*="gallery"] img',                    // Gallery view
+    '[data-testid="hollywood-image"] img',      
+    '[class*="Showcase"] img',                   
+    '[class*="carousel"] img',                   
+    '[class*="gallery"] img',                    
     'picture[class*="photo"] img',
     '[class*="hdp__sc-"] > picture img',
     '[aria-label*="view larger"] img',
-    '[class*="ZilPxlView"] img',                 // Zillow pixel view container
+    '[class*="ZilPxlView"] img',                 
   ];
   for (const sel of heroSelectors) {
     const imgs = document.querySelectorAll(sel);
     for (const img of imgs) {
       const src = img.src || img.dataset?.src || img.currentSrc || '';
       if (!src || seen.has(src)) continue;
-      // Skip tiny images (icons, logos), agent photos
       if (img.naturalWidth > 0 && img.naturalWidth < 100) continue;
       if (src.includes('logo') || src.includes('icon') || src.includes('avatar') || src.includes('agent') || src.includes('profile')) continue;
       if (src.includes('p_a/') || src.includes('p_e/')) continue;
-      // Accept any zillowstatic photo
       if (src.includes('zillowstatic') || src.includes('photos.zillow')) {
         photos.push(src);
         seen.add(src);
-        break; // First valid image is the hero
+        break; 
       }
     }
     if (photos.length > 0) break;
   }
 
-  // Strategy 2: NEXT_DATA photos array — look for responsive photo URLs
   try {
     const ndEl = document.getElementById('__NEXT_DATA__');
     if (ndEl) {
-      // Read the FULL NEXT_DATA — the photos array often sits beyond the first 30KB
-      // of Zillow's (very large) payload, so a slice was missing it entirely.
       const snippet = ndEl.textContent;
-      // Match multiple URL patterns — regular photos, Showcase photos, responsive images
       const patterns = [
         /"url"\s*:\s*"(https:\/\/[^"]*photos\.zillowstatic[^"]+)"/g,
         /"mixedSources"[\s\S]*?"url"\s*:\s*"(https:\/\/[^"]+zillowstatic[^"]+)"/g,
@@ -395,7 +369,6 @@ function extractPhotos() {
     }
   } catch(e) {}
 
-  // Strategy 3: All property images from DOM (fallback)
   if (photos.length === 0) {
     document.querySelectorAll('img[src*="zillowstatic"], img[src*="photos.zillow"]').forEach(img => {
       const src = img.src || img.dataset?.src || '';
@@ -412,46 +385,26 @@ function extractPhotos() {
   return photos.slice(0, 5);
 }
 
-// ── True listing photo count ────────────────────────────────────────────────────
-// extractPhotos() intentionally returns only a few hero/vision URLs (capped at 5),
-// so it must NOT be used to report how many photos the listing has. Zillow's
-// __NEXT_DATA__ carries the full gallery even before the page visually hydrates
-// (the gallery, agent block, and description often lazy-load after the core facts),
-// so we count from the FULL NEXT_DATA — not a truncated slice — plus the visible
-// "See all N photos" control as an authoritative shortcut when present.
 function countListingPhotos(fullText) {
-  // 1) Visible gallery control — most authoritative when the gallery has rendered
   let m = (fullText || '').match(/See all\s+(\d{1,4})\s+photos/i);
   if (m) { const n = parseInt(m[1], 10); if (n > 0 && n <= 5000) return n; }
-  // 2) Full NEXT_DATA (NOT sliced) — each gallery photo has one "mixedSources" object;
-  //    nearby/similar homes store single hi-res strings, so this targets the subject.
   try {
     const ndEl = document.getElementById('__NEXT_DATA__');
     if (ndEl && ndEl.textContent) {
       const txt = ndEl.textContent;
       const ms = (txt.match(/"mixedSources"/g) || []).length;
       if (ms > 0) return ms;
-      // Fallback: count unique full-property photo hashes (…/fp/{hash}-…)
       const hashes = new Set();
       for (const mm of txt.matchAll(/photos\.zillowstatic\.com\/fp\/([a-f0-9]{8,})-/gi)) hashes.add(mm[1]);
       if (hashes.size > 0) return hashes.size;
     }
   } catch (e) {}
-  // 3) Generic "N photos" text
   m = (fullText || '').match(/\b(\d{1,4})\s+photos?\b/i);
   if (m) { const n = parseInt(m[1], 10); if (n > 1 && n <= 5000) return n; }
   return 0;
 }
 
-// ── Comparable sales extractor ────────────────────────────────────────────────
 
-// ── Facts & Features DOM scraper ─────────────────────────────────────────────
-// Reads every label/value pair from Zillow's rendered Facts section.
-// This catches everything __NEXT_DATA__ misses due to field name mismatches.
-// Trim a scraped fact value to just its own value. Zillow facts are newline-separated
-// in innerText; this also defends against any two facts running together on one line
-// (cut at the next " Capitalized Label:") and caps length so a value can never balloon
-// into the whole page (the old textContent + [^\n]+ approach grabbed everything).
 function sanitizeFactValue(raw) {
   if (!raw) return '';
   let v = String(raw).trim();
@@ -462,52 +415,14 @@ function sanitizeFactValue(raw) {
 }
 
 function scrapeFactsFromDOM(data, fullText) {
-  // ── Strategy: full-text pattern matching on the rendered page text ─────────
-  // Zillow's Facts & Features section renders as visible text we can read
-  // directly from fullText. The structure from this listing is:
-  //
-  // Interior
-  //   Bedrooms & bathrooms
-  //     Bedrooms: 4 ...
-  //   Heating
-  //     * Electric
-  //   Cooling
-  //     * Central Air
-  //   Appliances
-  //     * Included: Dishwasher, Disposal, ...
-  //     * Laundry: Laundry Room
-  //   Features
-  //     * Ceiling Fan(s), Kitchen/Family Room Combo ...
-  //     * Flooring: Ceramic Tile, Porcelain Tile
-  //     * Has fireplace: No
-  //   Interior area
-  //     * Total interior livable area: 1,816 sqft
-  //     * Total structure area: 2,294
-  // Property
-  //   Lot
-  //     * Size: 5,285 Square Feet
-  // Construction
-  //   Type & style
-  //     * Home type: Townhouse
-  //   Materials
-  //     * Block
-  //     * Foundation: Slab
-  //     * Roof: Shingle
-  //   Condition
-  //     * Year built: 2018
 
   const patterns = [
-    // Interior — Heating / Cooling. Accept colon OR newline value (innerText format),
-    // and validate the value is a real heating/cooling type so a bare category header
-    // can never be captured as the value.
     { re: /Heating(?:\s*features?)?[:\s]+([^\n]{2,60})/i, field: 'heating',
       transform: v => /central|electric|gas|forced|heat\s*pump|baseboard|radiant|propane|solar|ductless|wall|window|geothermal|evaporative|hot\s*water|natural|zoned|none/i.test(v) ? v.trim() : '' },
     { re: /Cooling(?:\s*features?)?[:\s]+([^\n]{2,60})/i, field: 'cooling',
       transform: v => /central|electric|gas|wall|window|ductless|heat\s*pump|geothermal|evaporative|zoned|none|a\/?c|air/i.test(v) ? v.trim() : '' },
-    // Stories / levels
     { re: /(?:Stories|Levels|Number of stories)[:\s]+([^\n]{1,24})/i, field: 'stories',
       transform: v => /one|two|three|four|split|tri|multi|bi|\b[1-4]\b/i.test(v) ? v.trim() : '' },
-    // Pool / spa / view / waterfront (captured for documentation + red-flag audit)
     { re: /(?:Has\s+(?:private\s+)?pool|Private pool)[:\s]+(Yes|No)/i, field: 'poolText' },
     { re: /Pool features?[:\s]+([^\n]{2,60})/i,                          field: 'poolFeatures' },
     { re: /Has\s+spa[:\s]+(Yes|No)/i,                                     field: 'spaText' },
@@ -516,33 +431,25 @@ function scrapeFactsFromDOM(data, fullText) {
     { re: /\bView[:\s]+([^\n]{2,50})/i, field: 'viewText',
       transform: v => /water|lake|pond|golf|city|mountain|park|garden|trees?|pool|canal|preserve|conservation|river|ocean|beach|skyline/i.test(v) ? v.trim() : '' },
     { re: /Waterfront features?[:\s]+([^\n]{2,60})/i,                     field: 'waterfront' },
-    // Interior — Appliances (capture everything up to next section)
     { re: /\bAppliances\b[\s\n]+((?:[\*•\-][^\n]+\n?)+)/i,               field: 'appliances', multiline: true },
     { re: /(?:Appliances included|Included appliances)[:\s]+([^\n]{2,120})/i, field: 'appliances' },
-    // Zillow Interior → Appliances commonly renders "Appliances" then "Included: <list>"
     { re: /\bAppliances\b[\s\S]{0,15}?Included[:\s]+([^\n]{3,150})/i,     field: 'appliances' },
-    // Interior — Features block (flooring, fireplace, etc.)
     { re: /Flooring[:\s]+([^\n\*•]+)/i,                                   field: 'flooring' },
     { re: /Has fireplace[:\s]+(Yes|No)/i,                                 field: 'fireplaceText' },
     { re: /Common walls[^:]*:[:\s]+([^\n]+)/i,                            field: 'commonWalls' },
-    // Interior area
     { re: /Total interior livable area[:\s]+([0-9,]+)\s*sq/i,             field: 'sqftLivable' },
     { re: /Total structure area[:\s]+([0-9,]+)/i,                         field: 'sqftTotal' },
-    // Bedrooms/bathrooms — multiple Zillow rendering formats
     { re: /\bBedrooms[:\s]+(\d+)/i,                                       field: 'bedsVerify' },
     { re: /Full bathrooms[:\s]+(\d+)/i,                                   field: 'fullBaths' },
     { re: /(\d+)\s+full\s+bathroom/i,                                     field: 'fullBaths' },
     { re: /1\/2 bathrooms?[:\s]+(\d+)/i,                                  field: 'halfBaths' },
     { re: /(\d+)\s+half\s+bathroom/i,                                     field: 'halfBaths' },
     { re: /(\d+)\s+(?:one.half|1\/2)\s+bathroom/i,                       field: 'halfBaths' },
-    // Lot — cap at 500,000 sqft in transform to reject concatenation artifacts
     { re: /(?:^|\n)\s*Size[:\s]+([0-9,]+)\s*Square\s*Feet/im,            field: 'lotSize', transform: v => { const n = parseInt(v.replace(/,/g,''),10); return n > 0 && n <= 500000 ? n.toLocaleString() + ' sqft' : ''; } },
     { re: /\bLot\b[^0-9]{0,20}([0-9,]+)\s*(?:sq|Square\s*Feet)/i,       field: 'lotSize', transform: v => { const n = parseInt(v.replace(/,/g,''),10); return n > 0 && n <= 500000 ? n.toLocaleString() + ' sqft' : ''; } },
-    // Parking
     { re: /Total spaces[:\s]+(\d+)/i,                                     field: 'parkingSpaces' },
     { re: /Parking features[:\s]+([^\n]+)/i,                              field: 'parking' },
     { re: /Attached garage spaces[:\s]+(\d+)/i,                           field: 'garageSpaces' },
-    // Construction
     { re: /Home type[:\s]+([^\n]+)/i,                                     field: 'propertyType' },
     { re: /Property subtype[:\s]+([^\n]+)/i,                              field: 'propertySubtype' },
     { re: /Year built[:\s]+(\d{4})/i,                                     field: 'yearBuilt' },
@@ -550,21 +457,15 @@ function scrapeFactsFromDOM(data, fullText) {
     { re: /Builder\s*model[:\s]*([A-Za-z0-9][A-Za-z0-9\s\-]{1,20}?)(?=\s*(?:Utilities|Sewer|Water|Year|Lot|Type|Garage|HOA|New\s*con|Condi|Builder\s*name|\*|$))/i,  field: 'builderModelText' },
     { re: /Roof[:\s]+([^\n]+)/i,                                          field: 'roofType' },
     { re: /Foundation[:\s]+([^\n]+)/i,                                    field: 'foundation' },
-    // Construction material — "Block" appears as a standalone bullet
-    // Construction materials — a single material on its own line, OR a comma list
-    // ("Block, Stucco, Wood Frame"), OR after a "Materials" sub-header. Validate the
-    // captured value actually contains a known material so a stray header can't match.
     { re: /(?:^|\n)\s*\*?\s*((?:Block|Brick|Stucco|Wood\s*Frame|Concrete|CBS|Stone|Vinyl\s*Siding|Fiber\s*Cement|HardiPlank|Cement\s*Siding|Metal\s*Siding)(?:\s*,\s*[A-Za-z][A-Za-z\s\/]+?)*)\s*(?:\n|$)/im, field: 'constructionMaterials' },
     { re: /(?:^|\n)\s*Materials\s*\n\s*([A-Z][A-Za-z,\s\/&-]{2,80})/i, field: 'constructionMaterials',
       transform: v => /block|brick|stucco|wood\s*frame|concrete|cbs|stone|vinyl|cement|hardiplank|fiber|metal\s*siding/i.test(v) ? v.trim() : '' },
     { re: /Construction materials?[:\s]+([^\n]+)/i,                       field: 'constructionMaterials' },
     { re: /New construction[:\s]+(Yes|No)/i,                              field: 'newConstructionText' },
     { re: /Condition[:\s]+([^\n]+)/i,                                     field: 'condition' },
-    // Community
     { re: /Subdivision[:\s]+([^\n]+)/i,                                   field: 'subdivision' },
     { re: /HOA fee[:\s]+\$?([0-9,]+)\s*(?:monthly|\/mo)?/i,              field: 'hoaFeeText' },
     { re: /HOA name[:\s]+([^\n]+)/i,                                      field: 'hoaNameText' },
-    // Financial
     { re: /Parcel number[:\s]+([0-9\-A-Z]+)/i,                           field: 'parcelNumber' },
     { re: /Tax assessed value[:\s]+\$?([0-9,]+)/i,                       field: 'taxAssessedText' },
     { re: /Annual tax amount[:\s]+\$?([0-9,]+)/i,                        field: 'taxAnnualText' },
@@ -574,17 +475,13 @@ function scrapeFactsFromDOM(data, fullText) {
     { re: /Listing\s+courtesy\s+of[:\s]+([^,\n\d]{3,60}?)(?=\s*\d{3}[-.]\d{3}|\s*,|\n|$)/i, field: 'agentNameText' },
     { re: /Source:\s*([A-Z][A-Za-z0-9]{1,20})(?=\s|,|as\s|$)/,          field: 'mlsSourceText' },
     { re: /Zoning[:\s]+([^\n]+)/i,                                       field: 'zoning' },
-    // Sewer/water
     { re: /Sewer[:\s]+([^\n]+)/i,                                         field: 'sewer' },
     { re: /(?:^|\n)\s*\*?\s*Water\s*:\s*([^\n]{2,40})/im,                 field: 'waterSource',
       transform: v => /public|private|well|city|municipal|cistern|spring|community|county|shared/i.test(v) ? v.trim() : '' },
-    // Features
     { re: /Exterior features?[:\s]+([^\n]+)/i,                            field: 'exteriorFeaturesText' },
     { re: /Interior features?[:\s]+([^\n]+)/i,                            field: 'interiorFeaturesText' },
-    // Agent
     { re: /Listing Provided by[:\s]*\n?\s*([^\n\d,]{4,60})(?:\s+\d{3})/i, field: 'agentNameText' },
     { re: /Source[:\s]+([^\n,]+),\s*MLS/i,                               field: 'mlsSourceText' },
-    // Rental-specific facts (appear in Facts & Features on rental listings)
     { re: /(?:Lease|Lease type|Lease term)[:\s]+([^\n]+)/i,               field: 'leaseTermsText' },
     { re: /Pets[:\s]+([^\n]+)/i,                                           field: 'petPolicyText' },
     { re: /Pet policy[:\s]+([^\n]+)/i,                                     field: 'petPolicyText' },
@@ -595,33 +492,26 @@ function scrapeFactsFromDOM(data, fullText) {
     { re: /Utilities included[:\s]+([^\n]+)/i,                             field: 'utilitiesIncludedText' },
   ];
 
-  // Match against the rendered-text snapshot (captured while scrolled down, so the
-  // Facts & Features section is present) first, then live innerText, then fullText.
-  // textContent strips newlines, which made per-line value patterns ([^\n]+) swallow
-  // the whole page; innerText/snapshot preserve the line boundaries we anchor on.
   const factText = _chRenderedText
     || (typeof document !== 'undefined' && document.body && document.body.innerText)
     || (fullText || '');
 
   for (const { re, field, multiline, transform } of patterns) {
-    if (data[field]) continue; // don't overwrite existing data
+    if (data[field]) continue; 
     const m = factText.match(re);
     if (!m) continue;
 
     let val = m[1]?.trim() || '';
     if (!val) continue;
     if (multiline) {
-      // Clean up bullet points from multiline match
       val = val.replace(/[\*•\-]\s*/g, '').replace(/\n+/g, '; ').trim();
     } else if (!transform) {
-      // Plain per-line text value — trim to its own value and cap length (anti-bloat)
       val = sanitizeFactValue(val);
     }
     if (transform) val = transform(val);
     if (val) data[field] = val;
   }
 
-  // ── Apply extracted fields back to main data fields ───────────────────────
   if (!data.sqft && data.sqftLivable)    data.sqft   = parseNum(data.sqftLivable);
   if (!data.yearBuilt && data.yearBuilt) data.yearBuilt = data.yearBuilt;
   if (!data.builderName && data.builderNameText) data.builderName = data.builderNameText.trim();
@@ -631,7 +521,6 @@ function scrapeFactsFromDOM(data, fullText) {
   }
   if (!data.hoaFee && data.hoaFeeText)   data.hoaFee = parseNum(data.hoaFeeText);
   if (!data.hoaName && data.hoaNameText) data.hoaName = data.hoaNameText;
-  // HTML is source of truth for MLS# and agent — always overwrite NEXT_DATA
   if (data.agentNameText) data.agentName = data.agentNameText.trim();
   if (data.mlsIdText)     data.mlsId     = data.mlsIdText.trim();
   if (data.mlsSourceText) data.mlsSource = data.mlsSourceText.trim();
@@ -639,50 +528,40 @@ function scrapeFactsFromDOM(data, fullText) {
   if (data.newConstructionText)          data.newConstruction = /yes/i.test(data.newConstructionText);
   if (data.fireplaceText)               data.fireplace = /yes/i.test(data.fireplaceText);
 
-  // Pool / spa / view / waterfront — consolidate the raw captures into clean fields
-  // (kept for documentation + red-flag auditing; do not change the analysis output).
   if (!data.hasPool && (data.poolText === 'Yes' || data.poolFeatures)) data.hasPool = true;
   if (data.poolFeatures && !data.poolDetail) data.poolDetail = data.poolFeatures;
   if (!data.spa && (data.spaText === 'Yes' || data.spaFeatures)) data.spa = data.spaFeatures || true;
   if (!data.view && (data.viewText || data.viewHas === 'Yes')) data.view = data.viewText || 'Yes';
 
-  // Garage from spaces
   if (!data.garage && data.garageSpaces) data.garage = `${data.garageSpaces} space(s)`;
 
-  // Beds/baths cross-check (use the explicit counts if they're different from summary)
   if (data.bedsVerify && parseNum(data.bedsVerify) > 0) data.beds = parseNum(data.bedsVerify);
   if (data.fullBaths !== undefined || data.halfBaths !== undefined) {
     const full = parseNum(String(data.fullBaths || 0));
     const half = parseNum(String(data.halfBaths || 0));
-    // Sanity guard: full baths 0-10, half baths 0-4
     if (full <= 10 && half <= 4) {
       data.baths = full + (half * 0.5);
       if (full > 0 || half > 0) data.bathsDetail = `${full} full, ${half} half`;
     }
   }
-  // Absolute baths fallback — if baths is still >10 (concatenation artifact from NEXT_DATA),
-  // force a text-based extraction. Zillow commonly renders "3ba" or "3.5 ba" in header stats.
   if (data.baths > 10) {
     const headerBathM = fullText.slice(0, 2000).match(/(\d+(?:\.\d)?)\s*ba\b/i);
     if (headerBathM) data.baths = parseFloat(headerBathM[1]);
-    else data.baths = 0; // reset bogus value, let populatePanel show nothing
+    else data.baths = 0; 
   }
 
-  // Clean up temp fields
   ['sqftLivable','sqftTotal','bedsVerify','fullBaths','halfBaths','garageSpaces',
    'parkingSpaces','fireplaceText','newConstructionText','hoaFeeText','hoaNameText',
    'agentNameText','mlsIdText','mlsSourceText','taxAssessedText','taxAnnualText',
    'daysOnMarketText','exteriorFeaturesText','interiorFeaturesText','commonWalls'
   ].forEach(k => {
     if (data[k] !== undefined) {
-      // Move to proper field if not set
       if (k === 'exteriorFeaturesText' && !data.exteriorFeatures) data.exteriorFeatures = data[k];
       if (k === 'interiorFeaturesText' && !data.interiorFeatures) data.interiorFeatures = data[k];
       delete data[k];
     }
   });
 
-  // Lot size final fallback
   if (!data.lotSize) {
     const lotM = fullText.match(/\bLot\b[^0-9]{0,20}([0-9,]+)\s*(?:sq|Square)/i)
               || fullText.match(/(?:^|\n)\s*Size[:\s]+([0-9,]+)\s*Square/im);
@@ -702,14 +581,10 @@ function matchAndSet(data, factMap, label, value) {
   }
 }
 
-// ── Comparable sales scraper — Similar Homes + Nearby ────────────────────────
-// Scrapes Zillow's "Similar homes" and nearby carousels.
-// Also extracts from __NEXT_DATA__ nearbyHomes array for structured data.
 function extractComps() {
   const comps = [];
   const seen  = new Set();
 
-  // ── Method 1: __NEXT_DATA__ nearby homes (most reliable) ─────────────────
   try {
     const el = document.getElementById('__NEXT_DATA__');
     if (el) {
@@ -722,7 +597,6 @@ function extractComps() {
         const inner = JSON.parse(gdp[key]);
         nd = inner?.property || inner?.gdp || inner;
       }
-      // nearbyHomes or comps array
       const nearby = nd?.nearbyHomes || nd?.comps || nd?.similarHomes || [];
       for (const h of nearby.slice(0, 20)) {
         const addr  = h.address?.streetAddress || h.streetAddress || '';
@@ -746,7 +620,6 @@ function extractComps() {
     }
   } catch(e) {}
 
-  // ── Method 2: DOM carousel cards ─────────────────────────────────────────
   if (comps.length < 4) {
     const cardSelectors = [
       'article[data-test="property-card"]',
@@ -763,7 +636,6 @@ function extractComps() {
         const addr    = addrEl?.innerText?.trim() || '';
         const price   = parseNum(priceEl?.innerText || '');
         if (!price || !addr || seen.has(addr)) return;
-        // For rent mode, prices are monthly (typically $500-$10K). For sale, skip <$50K.
         const minPrice = (document.querySelector('[class*="for-rent"], [data-testid*="rent"]') || document.body.innerText.match(/for rent/i)) ? 200 : 50000;
         if (price < minPrice) return;
         seen.add(addr);
@@ -789,7 +661,6 @@ function extractComps() {
     }
   }
 
-  // ── Method 3: page text scan for price + address pairs ───────────────────
   if (comps.length < 3) {
     const text   = document.body.innerText;
     const regex  = /\$([0-9,]+)\s*\n([^\n]{10,80}(?:Dr|Ln|Ave|Blvd|Way|St|Ct|Rd|Aly|Loop|Ter|Pl|Cir)[^\n]{0,40})\n([\d]+ bd[^\n]*)/gi;
@@ -818,36 +689,11 @@ function extractComps() {
   return comps.slice(0, 10);
 }
 
-// ── Price History DOM scraper ─────────────────────────────────────────────────
-// Reads the rendered Price History table directly from the page.
-// Works for all listing types (active, sold, rental) since Zillow always renders
-// the full price history table in the DOM. This is the most reliable source.
-//
-// Zillow's price history HTML (as of 2025):
-//   <h2 ...>Price history</h2>
-//   <div> (table wrapper)
-//     <div> (row) date | event | price | change%
-// ── Price history parser — single authoritative source ─────────────────────────
-// Reads rendered page text directly. Works for all listing modes.
-// ── Listing-agent "Listed by" capture ────────────────────────────────────────
-// Zillow renders the "Listed by" attribution lazily near the bottom of the page
-// and unmounts it again when we scroll back to the top, so by the time scrapeListing
-// reads the DOM it's gone (and the agent name is usually absent from NEXT_DATA too —
-// only the brokerage is there). We therefore grab it WHILE the page is scrolled down,
-// during expandPriceHistory(), and stash the name + phone for the scraper to use.
 let _chListedByName  = '';
 let _chListedByPhone = '';
-// Agent name+phone grabbed from Zillow's stable attribution element
-// ([data-testid="attribution-LISTING_AGENT"]). Kept STICKY per-URL so the per-analysis
-// reset below can't wipe a good capture if the scroll/expand runs more than once.
 let _chAgentAttr    = { name: '', phone: '' };
 let _chAgentAttrUrl = '';
 
-// ── Agent bank: sessionStorage keyed by zpid ─────────────────────────────────
-// The diagnostics proved the agent gets CAPTURED (e.g. "Jane Agent") and then LOST before
-// output (module-var resets / re-runs). So the agent is now banked to sessionStorage
-// the instant it is ever seen — immune to every reset, re-injection, and re-run —
-// and stamped onto the scraped data as the FINAL step of scrapeListing().
 function chAgentKey() {
   const m = location.href.match(/(\d+)_zpid/);
   return 'chAgent_' + (m ? m[1] : location.pathname);
@@ -867,9 +713,6 @@ function chSaveAgent(name, phone) {
   } catch (e) {}
 }
 
-// Direct parse: find "Listed by" anywhere in the text and read the name + first phone
-// right after it. Handles both rendered newlines and concatenated textContent
-// ("Listed by:Jane Agent 555-555-0101,EXAMPLE REALTY LLC 555-555-0102").
 function chParseAgentDirect(text) {
   if (!text) return { name: '', phone: '' };
   const norm = text.replace(/\u00A0/g, ' ');
@@ -883,8 +726,6 @@ function chParseAgentDirect(text) {
   return { name: m[1].trim(), phone: pm ? `${pm[1]}-${pm[2]}-${pm[3]}` : '' };
 }
 
-// Read the agent from live DOM right now: the stable testid element first, then any
-// small attribution-ish element containing "Listed by".
 function chProbeAgentNow() {
   try {
     const el = document.querySelector('[data-testid="attribution-LISTING_AGENT"]');
@@ -897,8 +738,6 @@ function chProbeAgentNow() {
         return;
       }
     }
-    // Fallback probe: any element carrying an attribution testid, or a <p> that
-    // contains "Listed by" — parse its (small) text directly.
     const cands = document.querySelectorAll('[data-testid*="attribution"], p');
     for (const c of cands) {
       const t = (c.textContent || '');
@@ -910,43 +749,21 @@ function chProbeAgentNow() {
   } catch (e) {}
 }
 
-// Persistent watcher: every 600ms until banked, probe for the agent. Runs from page
-// load, so the moment Zillow ever mounts the attribution — during OUR scroll or the
-// USER's own scrolling — it gets banked for this zpid.
 setInterval(() => {
   try {
     const cur = chReadAgent();
-    if (cur.name && cur.phone) return;   // already banked for this listing
+    if (cur.name && cur.phone) return;   
     chProbeAgentNow();
   } catch (e) {}
 }, 600);
-// Full page innerText snapshot taken WHILE scrolled to the bottom (everything rendered).
-// Zillow unmounts off-screen sections (Facts & Features, description, "Listed by",
-// schools) once we scroll back to the top, so a post-scroll read misses them. We run
-// the text-based scrapers against this snapshot so those sections are captured.
 let _chRenderedText = '';
-// Listing description captured from the DOM while scrolled down (nd.description is
-// frequently empty in the initial payload, and the section unmounts on scroll-to-top).
 let _chDescription = '';
-// "Similar homes" carousel captured while scrolled down — it lazy-loads near the
-// bottom and unmounts on scroll-to-top, so a post-scroll read often gets nothing.
 let _chNearbyHomes = [];
 
-// Brute-force the listing-agent attribution from page text, bounded by the stable
-// anchors that wrap it: it appears AFTER "Listing updated:" / "Zillow last checked:"
-// and BEFORE the "IDX information" / "Listing Information presented by" disclaimer.
-// This is the most reliable grab — the agent name is often absent from NEXT_DATA and
-// the rendered block is finicky. Returns {name, phone}.
 const COMPANY_RE = /\b(LLC|INC|REALTY|REAL ESTATE|GROUP|TEAM|BROKERAGE|PROPERTIES|HOMES|ASSOCIATES|COMPANY|CORP|LLP|\bPA\b|REALTORS?)\b/i;
 
-// Diagnostics for the historically-troublesome agent grab — dumped in the logs so we
-// can SEE which text source actually contains the "Listed by" block.
 let _chAgentDebug = {};
 
-// Harvest text from the main DOM PLUS open shadow roots and same-origin iframes.
-// document.body.textContent / innerText do NOT pierce shadow roots or iframes, and
-// Zillow's MLS attribution footer is commonly rendered inside one of those — which is
-// why every plain-text method missed "Listed by" while NEXT_DATA-sourced fields worked.
 function harvestDeepText() {
   let main = '', shadow = '', frames = '';
   try { main = (document.body && document.body.textContent) || ''; } catch (e) {}
@@ -976,9 +793,6 @@ function harvestDeepText() {
     shadow:   /Listed by/i.test(shadow),
     iframe:   /Listed by/i.test(frames),
   };
-  // Snippet capture — record the actual text around "Listed by" so we can SEE the
-  // format/source. Check the combined deep text first, then the raw HTML markup
-  // (outerHTML includes text that textContent/innerText can miss).
   try {
     let snip = '';
     const li = combined.search(/Listed by/i);
@@ -995,23 +809,16 @@ function harvestDeepText() {
   return combined;
 }
 
-// Deep-harvest text snapshot (main DOM + shadow roots + iframes) taken during the
-// scroll, reused later for the brokerage-anchored agent grab.
 let _chDeepText = '';
-// Tight attribution-line block captured (node-level) during the scroll while mounted.
 let _chListedByBlock = '';
 
-// Grab the agent literally relative to the brokerage we already have. In the rendered
-// attribution the format is "Listed by: AGENT AGENTPHONE, BROKERAGE BROKERAGEPHONE",
-// so the agent name+phone sit immediately BEFORE the brokerage string. Whitespace- and
-// case-normalized so a non-breaking space or case difference can't break the match.
 function parseAgentByBrokerageAnchor(text, brokerage) {
   if (!text || !brokerage) return { name: '', phone: '' };
   const norm = text.replace(/\u00A0/g, ' ');
   const lc = norm.toLowerCase();
   let idx = lc.indexOf(brokerage.toLowerCase());
   if (idx < 0) {
-    const tok = brokerage.split(/\s+/)[0];           // looser: first brokerage token
+    const tok = brokerage.split(/\s+/)[0];           
     if (tok && tok.length > 2) idx = lc.indexOf(tok.toLowerCase());
   }
   if (idx < 0) return { name: '', phone: '' };
@@ -1024,10 +831,6 @@ function parseAgentByBrokerageAnchor(text, brokerage) {
   return { name: '', phone: '' };
 }
 
-// Node-level grab: walk the DOM (incl. open shadow roots + same-origin iframes) and find
-// the SMALLEST element whose text holds "Listed by" or the brokerage AND a phone number —
-// i.e. the actual attribution line — then return its raw text to parse. This is the
-// literal "find the line and copy it" approach, robust to where the blob harvest fails.
 function findListedByBlock(brokerage) {
   const norm = s => (s || '').replace(/\u00A0/g, ' ').replace(/[ \t\f\v]+/g, ' ').trim();
   const want = norm(brokerage).toLowerCase();
@@ -1035,7 +838,7 @@ function findListedByBlock(brokerage) {
   let best = '';
   const consider = (txt) => {
     const n = norm(txt);
-    if (!n || n.length > 400) return;            // attribution line is short
+    if (!n || n.length > 400) return;            
     const nl = n.toLowerCase();
     if ((/listed by/i.test(n) || (want && nl.includes(want))) && PHONE.test(n)) {
       if (!best || n.length < best.length) best = n;
@@ -1067,19 +870,14 @@ function parseListedByFromText(text) {
     const eIdx = after.search(/IDX information|Listing Information presented by|MLS Grid|Listings courtesy/i);
     region = eIdx > 0 ? after.slice(0, eIdx) : after.slice(0, 800);
   }
-  // If the anchors matched an unrelated early occurrence and the bounded region
-  // doesn't actually contain "Listed by", fall through to a direct window — don't
-  // give up just because the anchors framed the wrong slice of the page.
   if (!region || !/Listed by/i.test(region)) {
     const lb = text.search(/Listed by/i);
     if (lb < 0) return { name: '', phone: '' };
     region = text.slice(lb, lb + 240);
   }
-  // region ≈ "...Listed by: Jane Agent 555-555-0101, EXAMPLE REALTY LLC 555-555-0102 Source: Stellar MLS..."
   const m = region.match(/Listed by[:\s]*([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})/i);
   if (!m || COMPANY_RE.test(m[1])) return { name: '', phone: '' };
   const name = m[1].trim();
-  // First phone AFTER the name = the agent's phone (brokerage phone comes later)
   const tail = region.slice(region.indexOf(m[0]) + m[0].length);
   const pm = tail.match(/\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})/);
   return { name, phone: pm ? `${pm[1]}-${pm[2]}-${pm[3]}` : '' };
@@ -1088,10 +886,8 @@ function parseListedByFromText(text) {
 function captureListedByFromDOM() {
   try {
     _chAgentDebug = {};
-    // Deep harvest first (pierces shadow DOM + iframes), then plain text sources.
     const deep = harvestDeepText();
-    if (deep && deep.length > _chDeepText.length) _chDeepText = deep;   // keep richest snapshot
-    // Node-level attribution block, captured while the element is still mounted.
+    if (deep && deep.length > _chDeepText.length) _chDeepText = deep;   
     try { const blk = findListedByBlock(''); if (blk && blk.length > _chListedByBlock.length) _chListedByBlock = blk; } catch (e) {}
     const srcs = [deep];
     try { if (document.body) srcs.push(document.body.textContent || ''); } catch (e) {}
@@ -1101,16 +897,14 @@ function captureListedByFromDOM() {
       const r = parseListedByFromText(src);
       if (r.name) { _chListedByName = r.name; if (r.phone) _chListedByPhone = r.phone; }
     }
-    // Record what __NEXT_DATA__ contains for the agent, for diagnostics.
     try {
       const ndRaw = document.getElementById('__NEXT_DATA__')?.textContent || '';
       _chAgentDebug.nextDataHasAgentName = /"agentName"\s*:\s*"[^"]+"/.test(ndRaw);
       _chAgentDebug.nextDataLen = ndRaw.length;
     } catch (e) {}
     _chAgentDebug.captured = { name: _chListedByName || '', phone: _chListedByPhone || '' };
-    chSaveAgent(_chListedByName, _chListedByPhone);   // bank it — immune to resets
+    chSaveAgent(_chListedByName, _chListedByPhone);   
 
-    // DOM-element fallback: locate an element labeled "Listed by" and read its block
     if (!_chListedByName) {
       const els = document.querySelectorAll('p, div, span, li, h3, h4');
       for (const el of els) {
@@ -1129,22 +923,17 @@ function captureListedByFromDOM() {
         }
       }
     }
-    chSaveAgent(_chListedByName, _chListedByPhone);   // bank whatever we ended up with
+    chSaveAgent(_chListedByName, _chListedByPhone);   
   } catch (e) {}
 }
 
-// ── Auto-expand price history "Show more" before scraping ────────────────────
-// Primary agent grab: Zillow renders the listing agent in a stable element,
-//   <p data-testid="attribution-LISTING_AGENT"><span>Jane Agent</span> <span>555-555-0101,</span></p>
-// Read that element directly and split name / phone. Sticky per-URL so a good capture
-// survives even if expandPriceHistory (and its field reset) runs more than once.
 function captureAgentAttribution() {
   try {
     if (_chAgentAttrUrl !== location.href) { _chAgentAttr = { name: '', phone: '' }; _chAgentAttrUrl = location.href; }
-    if (_chAgentAttr.name && _chAgentAttr.phone) return;   // already have both
+    if (_chAgentAttr.name && _chAgentAttr.phone) return;   
     const el = document.querySelector('[data-testid="attribution-LISTING_AGENT"]');
     if (!el) return;
-    const t = (el.textContent || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();  // "Jane Agent 555-555-0101,"
+    const t = (el.textContent || '').replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();  
     if (!t) return;
     const pm = t.match(/\(?(\d{3})\)?[-.\s]?(\d{3})[-.\s]?(\d{4})/);
     const phone = pm ? `${pm[1]}-${pm[2]}-${pm[3]}` : '';
@@ -1152,7 +941,7 @@ function captureAgentAttribution() {
     if (name && name.length >= 2 && name.length < 60 && !COMPANY_RE.test(name)) {
       if (!_chAgentAttr.name)  _chAgentAttr.name  = name;
       if (phone && !_chAgentAttr.phone) _chAgentAttr.phone = phone;
-      chSaveAgent(_chAgentAttr.name, _chAgentAttr.phone);   // bank it — immune to resets
+      chSaveAgent(_chAgentAttr.name, _chAgentAttr.phone);   
     }
   } catch (e) {}
 }
@@ -1164,9 +953,6 @@ function expandPriceHistory() {
     Array.from(document.querySelectorAll('button, [role="button"], a'))
       .filter(el => {
         const txt = (el.innerText || el.textContent || '').trim();
-        // Expand value-bearing sections: "Show more", "See all", and Zillow's Facts
-        // accordion "See more facts and features" / "Read more" (description). Exclude
-        // anything with "less", and photo-gallery openers we don't need.
         if (/\bless\b/i.test(txt)) return false;
         return /^(show more|show all|see all|read more|see more)$/i.test(txt)
             || /(more facts and features|see more facts|show more facts)/i.test(txt)
@@ -1181,11 +967,6 @@ function expandPriceHistory() {
     mo.observe(document.body, { childList: true, subtree: true });
   });
 
-  // Dispatch CustomEvent to MAIN world scroll.js and wait for done event
-  // CustomEvents on document cross the isolated/MAIN world boundary.
-  // window properties do NOT cross — that's why previous approaches failed.
-  // Smart scroll: scrolls layout-container-desktop until footer sentinel is visible
-  // Stops as soon as footer-wrapper is in view — no fixed iteration count
   const scrollSmart = () => new Promise(resolve => {
     const onDone = (e) => {
       document.removeEventListener('_ch_scroll_smart_done', onDone);
@@ -1193,7 +974,6 @@ function expandPriceHistory() {
     };
     document.addEventListener('_ch_scroll_smart_done', onDone);
     document.dispatchEvent(new CustomEvent('_ch_scroll_smart'));
-    // Safety timeout: 25 seconds max
     setTimeout(() => { document.removeEventListener('_ch_scroll_smart_done', onDone); resolve(0); }, 25000);
   });
 
@@ -1201,15 +981,12 @@ function expandPriceHistory() {
     scrollingInProgress = true;
     urlObserver.disconnect();
     pushActivity('Scrolling page…');
-    _chListedByName = ''; _chListedByPhone = ''; _chRenderedText = ''; _chDescription = ''; _chNearbyHomes = []; _chDeepText = ''; _chListedByBlock = '';   // reset per analysis
+    _chListedByName = ''; _chListedByPhone = ''; _chRenderedText = ''; _chDescription = ''; _chNearbyHomes = []; _chDeepText = ''; _chListedByBlock = '';   
 
-    // Step 1: scroll to bottom so all lazy sections render
     const finalY = await scrollSmart();
     pushActivity('Scrolled — expanding sections…');
     await sleep(150);
 
-    // Step 2: expand all Show More buttons — re-query after each click
-    // waitForDOMSettled handles the pause; no extra sleep needed between clicks
     pushActivity('Expanding sections…');
     let clicks = 0;
     while (clicks < 50) {
@@ -1220,10 +997,6 @@ function expandPriceHistory() {
       clicks++;
     }
 
-    // Expanding sections changes page height, so we may no longer be at the bottom.
-    // Drive to the true bottom again and wait, so the very-bottom "Listed by"
-    // attribution (which renders only when scrolled into view) is mounted before we
-    // capture. Scroll the confirmed container AND the window for good measure.
     try {
       const sc = document.querySelector('.layout-container-desktop');
       for (let i = 0; i < 3; i++) {
@@ -1231,17 +1004,13 @@ function expandPriceHistory() {
         window.scrollTo(0, document.body.scrollHeight);
         await sleep(250);
       }
-      // Nudge the attribution into view if we can find it, to force its render.
       const lb = Array.from(document.querySelectorAll('p, div, span, li'))
         .find(el => /^Listed by\b/i.test((el.textContent || '').trim().slice(0, 12)));
       if (lb && lb.scrollIntoView) { lb.scrollIntoView({ block: 'center' }); await sleep(300); }
     } catch (e) {}
 
-    // Capture the "Listed by" agent attribution NOW, while we're scrolled to the
-    // bottom and it's rendered — Zillow unmounts it once we scroll back to the top.
-    captureAgentAttribution();     // primary: stable testid element
-    captureListedByFromDOM();      // backup: text-based
-    // The attribution can lazy-load a beat late; retry a few times.
+    captureAgentAttribution();     
+    captureListedByFromDOM();      
     let _agentTries = 0;
     while (!_chAgentAttr.name && !_chListedByName && _agentTries < 6) {
       await sleep(400);
@@ -1251,11 +1020,7 @@ function expandPriceHistory() {
       _agentTries++;
     }
     _chAgentDebug.retries = _agentTries;
-    // Snapshot the FULL rendered page text now (all lazy sections present) so the
-    // text scrapers (Facts & Features, description, schools) don't miss content
-    // that Zillow unmounts when we return to the top.
     try { _chRenderedText = document.body.innerText || ''; } catch (e) { _chRenderedText = ''; }
-    // Capture the listing description from its DOM element while it's rendered.
     try {
       const dsels = ['[data-testid="description"]', '[data-testid="description-text"]',
                      '[data-testid="listing-description"]', '[class*="description-text"]',
@@ -1266,10 +1031,8 @@ function expandPriceHistory() {
         if (txt.length > 40 && txt.length > _chDescription.length) _chDescription = txt;
       }
     } catch (e) {}
-    // Capture the "Similar homes" carousel NOW (rendered) — it unmounts on scroll-to-top.
     try { const nh = scrapeNearbyHomes(); if (Array.isArray(nh) && nh.length) _chNearbyHomes = nh; } catch (e) {}
 
-    // Step 3: scroll back to top via direct property set on the confirmed container
     pushActivity('Returning to top…');
     const scroller = document.querySelector('.layout-container-desktop');
     if (scroller) scroller.scrollTop = 0;
@@ -1313,82 +1076,59 @@ function expandPriceHistory() {
 
 
 
-// ── Scrape nearby homes from the comparable sales carousel ────────────────────
 function scrapeNearbyHomes() {
-  // DOM path (confirmed from live HTML):
-  // h2"Similar homes" → div.HeadingArea → div.CarouselHeader → div.StyledCarousel
-  //                                                               └─ ul[role="list"] ← target
   const homes = [];
   try {
-    // For sold/off-market: prefer "Comparable homes" section (recently sold comps)
-    // For buy: prefer "Similar homes"
-    // For rent: prefer "Similar homes for rent" / "More homes for rent"
     const allHeadings = Array.from(document.querySelectorAll('h2, h3, h4'));
 
-    // Try comparable homes first (sold/off-market pages)
     let h2 = allHeadings.find(el => /comparable homes/i.test(el.textContent));
 
-    // For For Sale: prefer "Similar homes" specifically before falling back to other variants
     if (!h2) {
       h2 = allHeadings.find(el => /^similar homes/i.test(el.textContent.trim()));
     }
-    // Last fallback: any nearby/more/rent heading
     if (!h2) {
       h2 = allHeadings.find(el => /nearby homes|more homes|homes for rent|homes for you/i.test(el.textContent));
     }
     if (!h2) return homes;
 
-    // Walk up ancestors to find the carousel container
     let carousel = null;
     let el = h2.parentElement;
     for (let i = 0; i < 10 && el; i++) {
-      // Try ul[role="list"] first (standard for-sale carousel)
       const ul = el.querySelector(':scope > ul[role="list"], ul[role="list"]');
       if (ul) { carousel = ul; break; }
-      // Try any container with property cards (rental carousel may not use ul[role="list"])
       const cards = el.querySelectorAll('[data-testid="property-card"], article[data-test="property-card"]');
       if (cards.length >= 2) { carousel = el; break; }
       el = el.parentElement;
     }
     if (!carousel) return homes;
 
-    // Find cards — use a Set to dedup by element reference
     const cardSet = new Set();
     for (const sel of ['[data-testid="property-card"]', 'article[data-test="property-card"]', '[class*="StyledPropertyCard"]']) {
       carousel.querySelectorAll(sel).forEach(c => cardSet.add(c));
     }
-    // Filter out cards nested inside other cards
     const cards = Array.from(cardSet).filter(c => {
       let parent = c.parentElement;
       while (parent && parent !== carousel) {
-        if (cardSet.has(parent)) return false; // this card is nested inside another card
+        if (cardSet.has(parent)) return false; 
         parent = parent.parentElement;
       }
       return true;
     });
 
-    // Common street abbreviations used in Zillow URLs
     const STREET_ABBR = ['St','Ave','Blvd','Dr','Rd','Ln','Ct','Pl','Way','Trl','Ter','Aly','Loop','Pkwy','Cir','Hwy'];
-    // Two-word state abbreviations don't exist — but multi-word cities do
-    // Strategy: parse URL path after /homedetails/, split by "-"
-    // Last token = zpid (skip), second-to-last after stripping zpid = zip, before = state (2 caps), before = city words
-    // Everything before first street abbr word (case-insensitive) = street address
     function parseAddrFromUrl(href) {
       try {
         const m = href.match(/\/homedetails\/([^/]+)\//);
         if (!m) return '';
         const parts = m[1].split('-');
-        // Find last street abbreviation to split street from city/state/zip
         const abbrLower = STREET_ABBR.map(s => s.toLowerCase());
         let splitIdx = -1;
         for (let i = parts.length - 1; i >= 0; i--) {
           if (abbrLower.includes(parts[i].toLowerCase())) { splitIdx = i; break; }
         }
-        if (splitIdx === -1) return parts.join(' '); // fallback: whole thing
+        if (splitIdx === -1) return parts.join(' '); 
         const streetParts = parts.slice(0, splitIdx + 1);
-        // After street abbr: city words, then 2-letter state, then zip
         const rest = parts.slice(splitIdx + 1);
-        // Last is zip (5 digits), second-to-last is state (2 letters)
         const zip   = rest[rest.length - 1];
         const state = rest[rest.length - 2];
         const cityParts = rest.slice(0, rest.length - 2);
@@ -1401,7 +1141,6 @@ function scrapeNearbyHomes() {
     const seenAddrs = new Set();
     for (const card of cards) {
       try {
-        // Price: try multiple selectors
         let price = card.querySelector('[data-testid="data-price-row"]')?.textContent?.trim() || '';
         if (!price) {
           const priceEl = card.querySelector('[class*="price"], [class*="Price"]');
@@ -1424,16 +1163,11 @@ function scrapeNearbyHomes() {
         const addr = addrFromUrl || addrDom || addrAria;
         if (!addr) continue;
 
-        // Dedup by normalized address
         const addrKey = addr.toLowerCase().replace(/[^a-z0-9]/g, '');
         if (seenAddrs.has(addrKey)) continue;
         seenAddrs.add(addrKey);
 
         const cardText = card.textContent || '';
-        // Stats: combine aria-labels (clean "4 beds, 4 baths, 2,400 sqft") with card text,
-        // then strip the price token PRECISELY ($ + 1-3 digits + comma-groups) so its
-        // trailing digits don't bleed into the bedroom count — textContent has no
-        // separators, so "$589,9004 bd" was making a greedy strip eat the beds digit.
         const ariaAll = Array.from(card.querySelectorAll('[aria-label]'))
           .map(e => e.getAttribute('aria-label') || '').join(' ');
         const statSrc = (ariaAll + ' ' + cardText).replace(/\$\d{1,3}(?:,\d{3})*(?:\.\d+)?/g, ' ');
@@ -1466,13 +1200,9 @@ function scrapeNearbyHomes() {
   return homes;
 }
 
-// ── Scrape nearby schools ─────────────────────────────────────────────────────
 function scrapeNearbySchools() {
   const schools = [];
   try {
-    // Strategy 1: Find the "Nearby schools" section and walk its child elements.
-    // Zillow renders school cards with: rating number, school name (link), type, grades, distance.
-    // The section heading is "Nearby schools" followed by "GreatSchools rating" subheading.
     const allEls = document.querySelectorAll('h4, h5, h6, [class*="heading"], [class*="Heading"], [data-testid*="school"]');
     let schoolSection = null;
     for (const el of allEls) {
@@ -1483,12 +1213,10 @@ function scrapeNearbySchools() {
     }
 
     if (schoolSection) {
-      // Find all links (school names) or text blocks within the section
       const links = schoolSection.querySelectorAll('a[href*="school"], a[href*="greatschools"]');
       for (const link of Array.from(links).slice(0, 6)) {
         const name = (link.textContent || '').trim();
         if (!name || name.length < 4 || /GreatSchools|rating|nearby/i.test(name)) continue;
-        // Look in the surrounding card for rating, grades, distance
         const card = link.closest('li') || link.closest('[class*="card"]') || link.closest('div')?.parentElement;
         const cardText = card?.textContent || '';
         const ratingM = cardText.match(/(\d+)\s*\/\s*10/);
@@ -1507,7 +1235,6 @@ function scrapeNearbySchools() {
       }
     }
 
-    // Strategy 2: DOM rating bubble walk-up (original approach, kept as fallback)
     if (!schools.length) {
       const ratingEls = Array.from(document.querySelectorAll('[class*="rating"],[class*="Score"],[class*="score"]'))
         .filter(el => /^\d\/10$|^\d$/.test((el.innerText||'').trim()));
@@ -1540,13 +1267,11 @@ function scrapeNearbySchools() {
 
 
 
-// Sort price history newest-first. Dates are M/D/YYYY strings.
-// Compares year first, then month, then day — as requested.
 function sortHistory(rows) {
   const toYMD = (d) => {
     const m = (d||'').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
     if (!m) return [0, 0, 0];
-    return [+m[3], +m[1], +m[2]]; // [year, month, day]
+    return [+m[3], +m[1], +m[2]]; 
   };
   return rows.slice().sort((a, b) => {
     const [ay, am, ad] = toYMD(a.date);
@@ -1558,8 +1283,6 @@ function sortHistory(rows) {
 }
 
 async function parsePriceHistoryFromPage() {
-  // Strategy: try DOM table first (works after expandPriceHistory() clicks "Show more"),
-  // then fall back to fetch() + HTML parse if DOM gives nothing.
   const EVENT_KEYWORDS = [
     'Listed for sale','Listed for rent','Pending sale','Back on market',
     'Listing removed','Pre-foreclosure','Price change','Pending','Sold'
@@ -1577,13 +1300,11 @@ async function parsePriceHistoryFromPage() {
     return { date, event, price };
   };
 
-  // ── Method 1: DOM <table> parse (works after expand click) ───────────────
   const results = [];
   try {
     const tables = document.querySelectorAll('table');
     for (const table of tables) {
       let isPriceTable = false;
-      // Check header row
       const hdr = table.querySelector('tr');
       if (hdr) {
         const htxt = (hdr.innerText || hdr.textContent || '').toLowerCase();
@@ -1591,7 +1312,6 @@ async function parsePriceHistoryFromPage() {
           isPriceTable = true;
         }
       }
-      // Check preceding sibling for "Price history" heading
       if (!isPriceTable) {
         let el = table.previousElementSibling;
         for (let i=0; i<5 && el; i++) {
@@ -1620,21 +1340,18 @@ async function parsePriceHistoryFromPage() {
 
   if (results.length > 0) return sortHistory(results);
 
-  // ── Method 2: fetch() + HTML parse (fallback if DOM parse empty) ─────────
   try {
     const html = await fetch(window.location.href, {
       credentials: 'include',
       headers: { 'Accept': 'text/html,application/xhtml+xml', 'Accept-Language': 'en-US,en;q=0.9' }
     }).then(r => r.ok ? r.text() : Promise.reject(r.status));
 
-    // 2a: real <td> HTML
     const tdRe = /<tr[^>]*>\s*<td[^>]*>([^<]+)<\/td>\s*<td[^>]*>([^<]*)<\/td>(?:\s*<td[^>]*>([^<]*)<\/td>)?/gi;
     for (const m of html.matchAll(tdRe)) {
       const r = parseRow(m[1], m[2], m[3]||'');
       if (r) results.push(r);
     }
 
-    // 2b: markdown pipe format
     if (!results.length) {
       const rowRe = /^\|\s*(\d{1,2}\/\d{1,2}\/\d{4})\s*\|\s*([^|]+?)\s*\|\s*([^|]*?)\s*\|/gm;
       for (const m of html.matchAll(rowRe)) {
@@ -1663,14 +1380,7 @@ async function scrapeZillow(data) {
   const fullText = extractFullPageText();
   const bodyInnerText = document.body.innerText || '';
 
-  // ── Mode detection — multi-signal with hard override from price history ──
-  // The SINGLE most reliable signal is the top of the price history table:
-  //   "Sold" → recently sold. "Listing removed" → off-market or sold.
-  //   "Listed for sale" / "Price change" / "Pending" → active for-sale.
-  //   "Listed for rent" → rental.
-  // We check this FIRST because NEXT_DATA homeStatus can be stale/wrong.
 
-  // Step 0: Price history text scan — the definitive check
   try {
     const phText = bodyInnerText.match(/Price history[\s\S]{0,300}/i)?.[0] || '';
     const phEvents = phText.match(/\d{1,2}\/\d{1,2}\/\d{4}\s*\n?\s*(Sold|Listed for sale|Listed for rent|Price change|Listing removed|Pending|Back on market|Pre-foreclosure)/gi);
@@ -1692,17 +1402,13 @@ async function scrapeZillow(data) {
     }
   } catch(e) {}
 
-  // Step 0b: Rent-specific signals — /mo price display or property type header
   if (!data.listingMode) {
     try {
       const topText = bodyInnerText.slice(0, 1500);
-      // Zillow shows "$X,XXX/mo" for rentals and "$XXX,XXX" for sales
-      // Check for /mo in the price area (within first 600 chars past nav)
       if (/\$[\d,]+\s*\/\s*mo/i.test(topText.slice(150, 800))) {
         data.listingMode = 'rent';
         data.homeStatus  = 'FOR_RENT';
       }
-      // Check for "[Type] for rent" header
       if (/(?:house|home|apartment|condo|townhouse|single.?family|multi.?family|duplex)\s+for\s+rent/im.test(topText.slice(150, 800))) {
         data.listingMode = 'rent';
         data.homeStatus  = 'FOR_RENT';
@@ -1710,12 +1416,10 @@ async function scrapeZillow(data) {
     } catch(e) {}
   }
 
-  // Step 1: NEXT_DATA homeStatus — only if price history didn't set mode
   if (!data.listingMode) {
     try {
       const ndEl = document.getElementById('__NEXT_DATA__');
       if (ndEl) {
-        // Scan deeper — homeStatus can be far into the JSON
         const ndSnippet = ndEl.textContent.slice(0, 30000);
         const hsM = ndSnippet.match(/"homeStatus"\s*:\s*"([^"]+)"/);
         if (hsM) {
@@ -1743,11 +1447,10 @@ async function scrapeZillow(data) {
     } catch(e) {}
   }
 
-  // ── DOM text confirmation — only if NEXT_DATA didn't set mode ──────────
   if (!data.listingMode) {
     try {
       const hdrText = bodyInnerText.slice(0, 1000);
-      const afterNav = hdrText.slice(200); // skip nav area
+      const afterNav = hdrText.slice(200); 
 
       if (/off\s*market/im.test(afterNav)) {
         data.listingMode = 'sold'; data.homeStatus = 'OFF_MARKET'; data.isOffMarket = true;
@@ -1765,7 +1468,6 @@ async function scrapeZillow(data) {
     } catch(e) {}
   }
 
-  // ── Element scan — last resort if both NEXT_DATA and text failed ───────
   if (!data.listingMode) {
     try {
       const allEls = document.querySelectorAll('span, div, h1, h2, h3, p');
@@ -1782,33 +1484,24 @@ async function scrapeZillow(data) {
     } catch(e) {}
   }
 
-  // Default to buy if nothing matched
   if (!data.listingMode) { data.listingMode = 'buy'; data.homeStatus = 'FOR_SALE'; }
 
-  // ── DOM price anchor — read what Zillow actually renders ─────────────────
-  // Pass the mode detected above so scrapeListingPrice uses correct thresholds.
   const domPrice = scrapeListingPrice(data.listingMode);
   if (domPrice > 0) data.price = domPrice;
 
-  // Rent price is sealed at end of scrapeListing — no mid-scrape intervention needed here
 
-  // ── PRIMARY: __NEXT_DATA__ JSON blob ─────────────────────────────────────
   const nd = extractZillowNextData();
   if (nd) {
-    // Address
     if (nd.address) {
       const a = nd.address;
       data.address = [a.streetAddress, a.city, a.state, a.zipcode].filter(Boolean).join(', ');
     }
-    // Only use nd.price if DOM scrape didn't already find a price
     if (!data.price) {
       data.price = nd.price || nd.listPrice || nd.listedPrice
                  || nd.unformattedPrice || nd.hdpData?.homeInfo?.price
                  || nd.homeInfo?.price || 0;
     }
 
-    // Cross-check against priceHistory listed event — BUT ONLY for buy/sold listings.
-    // data.listingMode is already set by the DOM status scan above — trust it.
     const isProbablyRent = data.listingMode === 'rent';
     if (!isProbablyRent) {
       const ph = nd.priceHistory || [];
@@ -1822,10 +1515,7 @@ async function scrapeZillow(data) {
         }
       }
     }
-    // priceHistory set before if(nd) block above
     data.beds        = nd.bedrooms || nd.beds || data.beds;
-    // nd.bathrooms is total count (integer). Prefer full/half breakdown for accuracy.
-    // Zillow resoFacts has bathroomsFull + bathroomsHalf — use these to get 3.5 instead of 4.
     const ndFullBaths = nd.resoFacts?.bathroomsFull || nd.resoFacts?.bathsFull || 0;
     const ndHalfBaths = nd.resoFacts?.bathroomsHalf || nd.resoFacts?.bathsHalf || 0;
     if (ndFullBaths > 0 && ndFullBaths <= 10) {
@@ -1837,14 +1527,10 @@ async function scrapeZillow(data) {
     }
     data.sqft        = nd.livingArea || nd.livingAreaValue || data.sqft;
 
-    // Year built — check multiple paths
     data.yearBuilt = nd.yearBuilt || nd.builtYear
                   || nd.resoFacts?.yearBuilt || nd.resoFacts?.yearBuiltEffective
                   || nd.resoFacts?.originalConstructionYear || '';
 
-    // Lot size — check multiple paths
-    // Guard: lotAreaValue/lotSize from NEXT_DATA can return bogus huge numbers (e.g. 20M sqft).
-    // Cap at 500,000 sqft (~11.5 acres) for residential — anything bigger is likely bad data.
     const lotSqftRaw = nd.resoFacts?.lotSizeSquareFeet || nd.lotAreaValue || nd.lotSize || 0;
     const lotSqft  = (Number(lotSqftRaw) > 0 && Number(lotSqftRaw) <= 500000) ? Number(lotSqftRaw) : 0;
     const lotAcresRaw = nd.resoFacts?.lotSizeAcres || 0;
@@ -1854,22 +1540,17 @@ async function scrapeZillow(data) {
 
     data.propertyType = nd.homeType || nd.resoFacts?.propertySubType || nd.resoFacts?.propertyType || '';
     data.daysOnMarket = nd.daysOnZillow || nd.daysOnMarket || 0;
-    // Ignore blatantly false Zestimates (e.g. $222 — the $/sqft leaking in). A real
-    // Zestimate is never under $10K; below that we treat it as "not available".
     data.zestimate    = (nd.zestimate && nd.zestimate >= 10000) ? nd.zestimate : 0;
     data.rentZestimate = nd.rentZestimate || 0;
     data.rentZestimateRange = nd.rentZestimateRange || null;
 
-    // Grab last sold price from priceHistory for landlord cash flow analysis
     if (!data.lastSoldPrice || data.lastSoldPrice === 0) {
       const ph2 = Array.isArray(nd.priceHistory) ? nd.priceHistory : [];
       const soldEv = ph2.find(h => /^sold$/i.test((h.event || h.priceChangeType || '').trim()));
       if (soldEv?.price > 50000) data.lastSoldPrice = Number(soldEv.price);
     }
 
-    // Rent price derivation handled by final seal at end of scrapeZillow
 
-    // ── Listing mode detection ────────────────────────────────────────────────
     const homeStatus = nd.homeStatus
       || nd.hdpData?.homeInfo?.homeStatus
       || nd.resoFacts?.homeStatus
@@ -1877,8 +1558,6 @@ async function scrapeZillow(data) {
       || '';
     data.homeStatus = homeStatus;
 
-    // ── Supplementary data from NEXT_DATA homeStatus ─────────────────────────
-    // Mode is already set above. This block only extracts additional sold/rent data.
     if (data.listingMode === 'sold') {
       if (!data.soldPrice) {
         data.soldPrice = nd.lastSoldPrice || (
@@ -1890,7 +1569,6 @@ async function scrapeZillow(data) {
       if (!data.dateSold) data.dateSold = nd.dateSoldString || nd.dateSold || '';
       if (!data.daysToSell) data.daysToSell = nd.daysOnZillow || 0;
     } else if (data.listingMode === 'buy') {
-      // Check for rent relist signal — recent "Listed for rent" in priceHistory overrides buy
       const ph0 = nd.priceHistory;
       if (Array.isArray(ph0) && ph0.length > 0) {
         const latest = ph0[0];
@@ -1907,7 +1585,6 @@ async function scrapeZillow(data) {
       }
     }
 
-    // ── Rent-specific field extraction — runs whenever mode=rent ─────────────
     if (data.listingMode === 'rent') {
       const rf = nd.rentalListingDetails || nd.resoFacts || {};
       data.leaseTerms       = rf.leaseType || rf.leaseTerm || nd.leaseType || '';
@@ -1918,7 +1595,6 @@ async function scrapeZillow(data) {
       data.depositMin       = rf.depositMin || nd.depositMin || nd.deposit || 0;
       data.availableDate    = rf.availableFrom || nd.availableFrom || '';
       data.utilitiesIncluded = rf.utilitiesIncluded || nd.utilitiesIncluded || '';
-      // Landlord info
       const landlord = nd.rentalListingDetails?.contact || nd.attributionInfo || nd.listingAgent || {};
       data.landlordName     = landlord.displayName || landlord.agentName || landlord.memberFullName || '';
       data.landlordPhone    = landlord.phoneNumber || landlord.agentPhoneNumber || '';
@@ -1928,18 +1604,8 @@ async function scrapeZillow(data) {
       data.landlordProfileUrl = landlord.profileUrl || '';
     }
 
-    // Final default
     if (!data.listingMode) data.listingMode = 'buy';
 
-    // ── Price history cross-check guard rail ─────────────────────────────────
-    // After all mode detection, cross-check against priceHistory[0] (most recent event).
-    // This is a CONFIRMING check only — it can upgrade an unset mode or catch a truly
-    // stale homeStatus, but it CANNOT override a DOM-detected "For sale" label.
-    // Rules:
-    //   - If mode=buy AND ph[0] is a very recent SOLD event (within 14 days) → sold
-    //   - If mode=buy AND ph[0] is a recent "Listed for rent" (within 60 days) → rent
-    //   - If mode=sold AND ph[0] is "Listed for sale" (re-listed) → buy (seller relisted)
-    //   - If DOM found "For sale" (homeStatus=FOR_SALE), NEVER downgrade to sold/rent
     if (data.homeStatus !== 'FOR_SALE') {
       try {
         const ph = nd.priceHistory;
@@ -1950,14 +1616,12 @@ async function scrapeZillow(data) {
           const topDays = topDt && !isNaN(topDt) ? Math.round((Date.now() - topDt) / 86400000) : 999;
 
           if (data.listingMode === 'buy' && /^sold$/.test(topEv) && topDays < 14) {
-            // Very recent sold event with no DOM "For sale" label — truly sold
             data.listingMode = 'sold';
             data.homeStatus  = 'RECENTLY_SOLD';
           } else if (data.listingMode === 'buy' && /listed\s+for\s+rent/.test(topEv) && topDays < 60) {
             data.listingMode = 'rent';
             data.homeStatus  = 'FOR_RENT';
           } else if (data.listingMode === 'sold' && /listed\s+for\s+sale|^listed$/.test(topEv) && topDays < 60) {
-            // Seller relisted after falling out of escrow — it's active again
             data.listingMode = 'buy';
             data.homeStatus  = 'FOR_SALE';
           }
@@ -1965,7 +1629,6 @@ async function scrapeZillow(data) {
       } catch(e) {}
     }
 
-    // DOM header fallback — absolute last resort, only when homeStatus still unset
     if (!data.homeStatus) {
       try {
         const hdr = bodyInnerText.slice(0, 600);
@@ -1981,11 +1644,9 @@ async function scrapeZillow(data) {
 
     data.mlsId        = nd.mlsid || nd.resoFacts?.mlsListingId || nd.resoFacts?.mlsNumber || '';
     data.parcelNumber = nd.resoFacts?.parcelNumber || nd.parcelId || nd.resoFacts?.apn || '';
-    // Coordinates for radius-based comp search
     data.latitude     = nd.latitude  || nd.address?.latitude  || null;
     data.longitude    = nd.longitude || nd.address?.longitude || null;
 
-    // Parking/garage
     const garageSpaces = nd.resoFacts?.garageSpaces || nd.resoFacts?.numberOfGarageSpaces || 0;
     data.garage = garageSpaces ? `${garageSpaces} space(s)`
                 : nd.resoFacts?.hasGarage ? 'Yes'
@@ -1996,28 +1657,18 @@ async function scrapeZillow(data) {
     data.hoaFee  = nd.monthlyHoaFee || nd.resoFacts?.associationFee || nd.resoFacts?.hoaFee || '';
     data.hoaName = nd.resoFacts?.associationName || nd.resoFacts?.associationManagement || '';
 
-    // Listing description — NEXT_DATA is the reliable source: it's in the server
-    // payload even when the description section hasn't visually rendered yet (the
-    // DOM-based fallbacks below only fire if the page has hydrated). Without this,
-    // a partially-loaded page leaves the description empty and the AI never sees
-    // material disclosures like "roof needs repair", "3rd bedroom not usable", or
-    // "cash offer only". Take the longest of the available sources.
     const ndDesc = (nd.description || nd.homeDescription || nd.adTargets?.description || nd.resoFacts?.description || '').trim();
     if (ndDesc.length > (data.description || '').trim().length) data.description = ndDesc;
-    // Fall back to the description captured from the DOM during the scroll — NEXT_DATA's
-    // description is frequently empty in the initial payload for hydrated SPA listings.
     if (_chDescription && _chDescription.length > (data.description || '').trim().length) {
       data.description = _chDescription;
     }
 
-    // Builder name — NEXT_DATA only at this point; description-based fallback runs later
     data.builderName = nd.resoFacts?.builderName || nd.resoFacts?.builder || '';
     if (!data.builderName && nd.description) {
       const _bm = nd.description.match(/\b(DR\s+Horton|Lennar|Pulte|KB\s+Home|Taylor\s+Morrison|Meritage|Ryan\s+Homes|Toll\s+Brothers|Century\s+Communities|Smith\s+Douglas|Dream\s+Finders|Highland\s+Homes|Maronda|Beazer|David\s+Weekley)\b/i);
       if (_bm) data.builderName = _bm[1].replace(/\s+/g,' ').trim();
     }
 
-    // Property model — fullText DOM first (post-scroll), NEXT_DATA fallback
     const _sb = (s) => (s||'').replace(/\s*Builder\b|Builder$/gi, '').trim();
     const _domModelM = (fullText||'').match(/Builder\s+model[:\s]*([A-Za-z0-9][A-Za-z0-9\-]{1,20})/i);
     const _domModel  = _domModelM ? _sb(_domModelM[1]) : '';
@@ -2031,7 +1682,6 @@ async function scrapeZillow(data) {
     }
     data.zoning      = nd.resoFacts?.zoning || '';
 
-    // Construction fields — Zillow uses both singular and array forms
     const rf = nd.resoFacts || {};
     const arr = (v) => Array.isArray(v) ? v.join(', ') : (v || '');
 
@@ -2055,25 +1705,19 @@ async function scrapeZillow(data) {
     data.fireplace             = rf.hasFireplace || rf.fireplaceFeatures?.length > 0 || false;
     data.newConstruction       = nd.newConstruction || rf.newConstructionType === 'NEW_CONSTRUCTION' || false;
 
-    // Senior/age-restricted community — scrape the MLS field but flag it as unverified
-    // Agent-entered MLS data is frequently wrong. We only treat it as confirmed if the
-    // description or community name explicitly says "55+", "senior", or "age-restricted".
     const seniorFlagFromMLS = !!(rf.seniorCommunity || rf.seniorLivingCommunity
       || rf.ageRestricted || rf.communityFeatures?.some?.(f => /senior|55\+|age.restrict/i.test(f)));
     const seniorInDescription = /\b55\+|senior\s+community|age.restricted|active\s+adult/i.test(
       (nd.description || '') + ' ' + (data.hoaName || '') + ' ' + (data.subdivision || '')
     );
-    data.seniorCommunityMLS         = seniorFlagFromMLS;  // raw MLS field (potentially wrong)
-    data.seniorCommunityConfirmed   = seniorInDescription; // explicitly stated in description/name
-    data.seniorCommunityUnverified  = seniorFlagFromMLS && !seniorInDescription; // flag for QC
+    data.seniorCommunityMLS         = seniorFlagFromMLS;  
+    data.seniorCommunityConfirmed   = seniorInDescription; 
+    data.seniorCommunityUnverified  = seniorFlagFromMLS && !seniorInDescription; 
 
-    // Tax data — TWO sources, both extracted
-    // Source 1: resoFacts (listing sheet value — often what agent reports)
     data.taxAssessedValueListing = nd.resoFacts?.taxAssessedValue || 0;
     data.taxAnnualAmountListing  = nd.resoFacts?.taxAnnualAmount  || 0;
     data.taxYearListing          = nd.resoFacts?.taxYear          || '';
 
-    // Source 2: taxHistory array (public record from county)
     const taxHist = nd.taxHistory || [];
     if (Array.isArray(taxHist)) {
       data.taxHistory = taxHist.slice(0, 7).map(t => ({
@@ -2084,7 +1728,6 @@ async function scrapeZillow(data) {
       })).filter(t => t.taxPaid > 0 || t.assessed > 0);
     }
 
-    // Flag conflict: listing sheet tax vs public record
     const latestPublicTax = data.taxHistory?.[0]?.taxPaid || 0;
     const listingTax      = parseNum(String(data.taxAnnualAmountListing));
     if (latestPublicTax > 0 && listingTax > 0 && Math.abs(latestPublicTax - listingTax) > 200) {
@@ -2095,16 +1738,10 @@ async function scrapeZillow(data) {
       };
     }
 
-    // Price history is populated unconditionally below (outside this if(nd) block)
 
-    // Agent & brokerage — FSBO listings have no listing agent
-    // attributionInfo on FSBO may contain MLS co-op broker, not the seller
     const isFsboListing = nd.isForSaleByOwner || /for sale by owner|fsbo/i.test(nd.homeStatus || '');
-    // Merge BOTH attribution objects — an empty nd.listingAgent must not shadow a
-    // populated nd.attributionInfo (|| would pick the empty one), so fields fill gaps.
     const agent = Object.assign({}, nd.attributionInfo || {}, nd.listingAgent || {});
     if (!isFsboListing) {
-      // Cover the several field names Zillow uses across listing layouts.
       data.agentName     = agent.agentName || agent.listingAgentName || agent.memberFullName
                         || agent.listAgentFullName || agent.buyerAgentName || agent.trueName
                         || agent.agentFullName || '';
@@ -2112,28 +1749,15 @@ async function scrapeZillow(data) {
       data.brokerageName = agent.brokerName || agent.officeName || agent.listingOfficeName
                         || agent.brokerageName || '';
     } else {
-      // FSBO — owner is the seller, no licensed listing agent
       data.agentName     = '';
       data.brokerageName = '';
       data.isFSBO        = true;
     }
 
-    // "Listed by" attribution is the source of truth for the agent name (per request:
-    // just grab the name next to "Listed by:"). It is frequently absent from the parsed
-    // NEXT_DATA object AND unmounts from the DOM on scroll-to-top, so we try, in order:
-    // (1) the name captured during the scroll, (2) a RAW regex over the __NEXT_DATA__
-    // JSON text (present in the initial HTML even when our parsed object misses it),
-    // (3) the rendered-text snapshot, (4) a last-ditch live DOM read.
     if (!data.isFSBO) {
-      // PRIMARY: agent grabbed from the stable testid element during the scroll,
-      // stored sticky-per-URL so the field reset can't have wiped it.
       if (_chAgentAttr.name)  data.agentName  = _chAgentAttr.name;
       if (_chAgentAttr.phone && !data.agentPhone) data.agentPhone = _chAgentAttr.phone;
 
-      // FIRST source of truth: brute-force the "Listed by" line from the attribution
-      // block (bounded by "Listing updated:" … "IDX information"). Run it on the scroll
-      // snapshot, a fresh deep harvest (shadow DOM + iframes), and live text — overriding
-      // any partial NEXT_DATA value.
       if (!_chListedByName || !_chListedByPhone) {
         let deepNow = '';
         try { deepNow = harvestDeepText(); } catch (e) {}
@@ -2152,8 +1776,6 @@ async function scrapeZillow(data) {
       if (!data.agentName || !data.agentPhone) {
         try {
           const ndRaw = document.getElementById('__NEXT_DATA__')?.textContent || '';
-          // Scope to the subject's attributionInfo block so we don't grab a nearby
-          // home's agent (the first attributionInfo is the subject property's).
           const ai = ndRaw.indexOf('"attributionInfo"');
           const scope = ai >= 0 ? ndRaw.slice(ai, ai + 2500) : ndRaw;
           if (!data.agentName) {
@@ -2169,10 +1791,6 @@ async function scrapeZillow(data) {
         } catch (e) {}
       }
 
-      // Brokerage-anchored grab: we reliably have the brokerage, and the agent sits
-      // right next to it. Search (a) the raw NEXT_DATA JSON in a window AROUND the
-      // brokerage for the agentName sibling key, and (b) the rendered/deep-harvest text
-      // for the name immediately before the brokerage string.
       if ((!data.agentName || !data.agentPhone) && data.brokerageName) {
         try {
           const ndRaw = document.getElementById('__NEXT_DATA__')?.textContent || '';
@@ -2190,8 +1808,6 @@ async function scrapeZillow(data) {
           }
         } catch (e) {}
         if (!data.agentName || !data.agentPhone) {
-          // Node-level grab: find the actual attribution line element (pierces shadow
-          // DOM) and parse it directly — the literal "find the line and copy it".
           let block = '';
           try { block = findListedByBlock(data.brokerageName) || _chListedByBlock; } catch (e) { block = _chListedByBlock; }
           if (block) {
@@ -2215,8 +1831,6 @@ async function scrapeZillow(data) {
         }
       }
 
-      // Snapshot + live DOM fallback for the "Listed by:" line (handles the inline
-      // "Listed by: Name Phone, Brokerage" format and the name-on-next-line format).
       if (!data.agentName || !data.agentPhone) {
         const bt = _chRenderedText || (document.body && document.body.innerText) || '';
         if (!data.agentName) {
@@ -2231,8 +1845,6 @@ async function scrapeZillow(data) {
         }
       }
 
-      // Diagnostics: where is the brokerage anchor findable? (tells us if the agent
-      // text is reachable at all). Dumped in the log's AGENT CAPTURE DEBUG section.
       try {
         const ndTxt = document.getElementById('__NEXT_DATA__')?.textContent || '';
         _chAgentDebug.brokerage = data.brokerageName || '';
@@ -2243,39 +1855,27 @@ async function scrapeZillow(data) {
         _chAgentDebug.testidCapture = { name: _chAgentAttr.name || '', phone: _chAgentAttr.phone || '' };
         _chAgentDebug.testidElPresent = !!document.querySelector('[data-testid="attribution-LISTING_AGENT"]');
       } catch (e) {}
-      // Also surface the agent diagnostics in the DevTools console for quick inspection.
       try { console.log('%c[ClearHome AGENT DEBUG]', 'color:#4F6BFF;font-weight:bold', JSON.parse(JSON.stringify(_chAgentDebug))); } catch (e) {}
     }
 
-    // Zestimate range
     data.zestimateRange = {
       low:  nd.zestimate ? Math.round(nd.zestimate * 0.95) : 0,
       high: nd.zestimate ? Math.round(nd.zestimate * 1.05) : 0
     };
 
-    // Nearby schools
     if (nd.nearbySchools?.schools) {
       data.schools = nd.nearbySchools.schools.slice(0, 3).map(s => ({
         name: s.name, rating: s.rating, grades: s.grades, distance: s.distance
       }));
     }
 
-    // Climate/flood data if available
     data.floodFactor   = nd.floodFactor || nd.floodFactorSeverity || '';
     data.fireFactor    = nd.fireFactor  || '';
     data.heatFactor    = nd.heatFactor  || '';
   }
 
-  // ── DOM FACTS TABLE SCRAPER — reads the rendered Facts & Features section ─
-  // This is the definitive fallback. Whatever is visible to the user in the
-  // "Facts & features" accordion is what we read here. We walk every
-  // label→value pair in the page's fact sections.
   scrapeFactsFromDOM(data, fullText);
 
-  // Reject obviously-wrong roof/water values mis-captured from amenity/feature text
-  // (e.g. "Roof"→"COMMUNITY POOL", "Water"→"VIEWS"). These loose label patterns can
-  // latch onto nearby amenities; if the value doesn't read like a real roof/water
-  // type, clear it rather than feeding garbage into the prompt.
   if (data.roofType && !/(shingle|tile|metal|asphalt|concrete|slate|wood|shake|membrane|flat|composition|built.?up|tpo|epdm|rubber|clay|architectural|gable|hip|foam)/i.test(data.roofType)) {
     data.roofType = '';
   }
@@ -2283,20 +1883,15 @@ async function scrapeZillow(data) {
     data.waterSource = '';
   }
 
-  // Description — ensure the scroll-captured DOM description is used even when there
-  // was no NEXT_DATA block (prefer the longest available source).
   if (_chDescription && _chDescription.length > (data.description || '').trim().length) {
     data.description = _chDescription;
   }
 
-  // Sqft — "Total Interior Livable Area" is in the Facts & Features table
   if (!data.sqft) {
     const livableM = fullText.match(/total\s+interior\s+livable\s+area[:\s]+([0-9,]+)\s*sq/i);
     if (livableM) data.sqft = parseNum(livableM[1]);
   }
 
-  // Lot size — aggressive multi-strategy DOM scraper
-  // Run unconditionally so we can also OVERRIDE bad NEXT_DATA values.
   (function findLotSize() {
     const parseValid = (str) => {
       if (!str) return null;
@@ -2308,46 +1903,34 @@ async function scrapeZillow(data) {
       if (sqft) data.lotSize = sqft.toLocaleString() + ' sqft';
     };
 
-    // If existing lotSize is already valid, keep it
     if (data.lotSize) {
       const existingSqft = parseInt(String(data.lotSize).replace(/[^\d]/g, ''), 10);
       if (existingSqft > 0 && existingSqft <= 500000) return;
-      // Existing is bad — clear it and re-scrape
       data.lotSize = '';
     }
 
-    // Strategy 0: Find ALL "Size: N Square Feet" patterns in fullText.
-    // Residential Facts section renders as "Lot\n  Size: 5,764 Square Feet"
-    // but textContent strips newlines, so we look for the pattern globally
-    // and pick the smallest valid value (residential lots are small).
     const allSizeMatches = [...fullText.matchAll(/Size[:\s]+([0-9,]+)\s*Square\s*Feet/gi)]
       .map(m => parseInt(m[1].replace(/,/g, ''), 10))
       .filter(n => n > 0 && n <= 500000);
     if (allSizeMatches.length > 0) {
-      // Pick the minimum — residential lots are almost always the smallest match
-      // (house sqft like "2,477" won't match this pattern because it's "Total interior livable area" not "Size")
       const lot0 = Math.min(...allSizeMatches);
       setLot(lot0);
       return;
     }
 
-    // Strategy A: Facts section "Size: X Square Feet" with newline anchor
     const mA = fullText.match(/\bLot\b[\s\S]{0,80}?Size[:\s]+([0-9,]+)\s*Square\s*Feet/i)
             || fullText.match(/(?:^|\n)\s*Size[:\s]+([0-9,]+)\s*Square\s*Feet/im);
     const vA = parseValid(mA?.[1]);
     if (vA) { setLot(vA); return; }
 
-    // Strategy B: "Lot size: X,XXX sqft" or "Lot: X,XXX sqft"
     const mB = fullText.match(/\bLot(?:\s+size)?[:\s]+([0-9,]+)\s*(?:sqft|sq\s*ft)\b/i);
     const vB = parseValid(mB?.[1]);
     if (vB) { setLot(vB); return; }
 
-    // Strategy C: "X,XXX sqft lot" (with "lot" AFTER the number — matches header summary "5,764 sqft lot")
     const mC = fullText.match(/([0-9,]{3,7})\s*sqft\s*lot\b/i);
     const vC = parseValid(mC?.[1]);
     if (vC) { setLot(vC); return; }
 
-    // Strategy D: Walk DOM <dd> or text-based <dl> Lot rows
     const ddEls = document.querySelectorAll('dt, [class*="label"]');
     for (const dt of ddEls) {
       const lbl = (dt.textContent || '').trim().toLowerCase();
@@ -2355,7 +1938,6 @@ async function scrapeZillow(data) {
         const dd = dt.nextElementSibling;
         if (dd) {
           const t = (dd.textContent || '').trim();
-          // Accept values like "5,764 sqft", "5,764 Square Feet", or "0.13 acres"
           const mSqft = t.match(/([0-9,]{3,7})\s*(?:sqft|sq\s*ft|Square\s*Feet)/i);
           const mAcres = t.match(/([\d.]+)\s*acres?/i);
           const vD = parseValid(mSqft?.[1]);
@@ -2368,7 +1950,6 @@ async function scrapeZillow(data) {
       }
     }
 
-    // Strategy E: Acres pattern as last resort
     const mE = fullText.match(/\bLot(?:\s+size)?[:\s]+([\d.]+)\s*acres?/i);
     if (mE) {
       const acres = parseFloat(mE[1]);
@@ -2376,7 +1957,6 @@ async function scrapeZillow(data) {
     }
   })();
 
-  // Address fallback
   if (!data.address) {
     for (const sel of ['h1[data-testid="bdp-building-name"]', '[class*="homeInfo"] h1', 'h1']) {
       const el = document.querySelector(sel);
@@ -2385,7 +1965,6 @@ async function scrapeZillow(data) {
     if (!data.address) { const m = document.title.match(/^([^|]+)/); if (m) data.address = m[1].trim(); }
   }
 
-  // Price fallback — specific selectors only, safe token extraction
   if (!data.price) {
     const priceSelectors = ['.price-text','[data-testid="price"]','span[class*="PriceText"]','span[class*="price-text"]'];
     for (const sel of priceSelectors) {
@@ -2398,25 +1977,19 @@ async function scrapeZillow(data) {
     }
   }
   if (!data.price) {
-    // Last resort: scan header area. Use word-boundary aware matching:
-    // Match price patterns that end with a comma-group boundary (,000 ,500 etc)
-    // This prevents "$2,350,000" + "5beds" from reading as $23,500,005.
     const headerText = fullText.slice(0, 3000);
     const pricePattern = /\$([1-9]\d{0,2}(?:,\d{3})*)/g;
     const matches = [...headerText.matchAll(pricePattern)]
       .map(m => {
-        // Verify the char after the match isn't a digit (would indicate concatenation)
         const endIdx = m.index + m[0].length;
         const nextChar = headerText[endIdx];
-        if (nextChar && /\d/.test(nextChar)) return 0; // skip — merged with adjacent number
+        if (nextChar && /\d/.test(nextChar)) return 0; 
         return parseInt(m[1].replace(/,/g, ''), 10) || 0;
       })
       .filter(v => v > 100000 && v < 100000000);
     if (matches.length) data.price = Math.max(...matches);
   }
 
-  // Price sanity check — cross-validate against $/sqft shown on page.
-  // Tight bounds on the $/sqft value to avoid amplifying bad data.
   if (data.price && data.sqft && data.sqft > 0) {
     const ppsqMatch = fullText.match(/\$(\d{2,4})\s*(?:price\/sqft|\/sqft|per\s*sq)/i);
     const ppsqOnPage = ppsqMatch ? parseInt(ppsqMatch[1], 10) : 0;
@@ -2430,14 +2003,11 @@ async function scrapeZillow(data) {
   }
   if (!data.beds || !data.baths) {
     const bedM  = fullText.match(/Bedrooms[:\s]+(\d+)/i);
-    // Only match 'Full bathrooms: N' — never 'Bathrooms: 2 1/2' (total display)
-    // which produces e.g. 21 from '21/2', then + 0.5 halfBath = 21.5
     const bathM = fullText.match(/Full bathrooms[:\s]+(\d+)/i);
     if (!data.beds  && bedM)  data.beds  = parseNum(bedM[1]);
     if (!data.baths && bathM) data.baths = parseNum(bathM[1]);
   }
 
-  // Description fallback
   if (!data.description) {
     for (const sel of ['[data-testid="description-text"]', '[data-testid="listing-description"]', '[class*="description-text"]']) {
       const el = document.querySelector(sel);
@@ -2445,25 +2015,20 @@ async function scrapeZillow(data) {
     }
   }
 
-  // Builder name fallback — now data.description is populated, search it
-  // This is the reliable source: Claude finds DR Horton here, so do we
   if (!data.builderName && data.description) {
     const _bm = data.description.match(/\b(DR\s+Horton|Lennar|Pulte|KB\s+Home|Taylor\s+Morrison|Meritage|Ryan\s+Homes|Toll\s+Brothers|Century\s+Communities|Smith\s+Douglas|Dream\s+Finders|Highland\s+Homes|Maronda|Beazer|David\s+Weekley)\b/i);
     if (_bm) data.builderName = _bm[1].replace(/\s+/g, ' ').trim();
   }
-  // Last resort: fullText (textContent, may have no-separator concat)
   if (!data.builderName) {
     const _bnM = (fullText||'').match(/Builder\s*name[:\s]*([A-Z][A-Za-z0-9\s&'.,-]{1,40}?)(?=\s*(?:Builder\s*model|Year|Lot|Type|Garage|\*|$))/i);
     if (_bnM) data.builderName = _bnM[1].trim().replace(/\s+/g, ' ');
   }
 
-  // HOA from full text if not in NEXT_DATA
   if (!data.hoaFee) {
     const hoaM = fullText.match(/HOA fee[:\s]+\$?([0-9,]+)\s*monthly/i);
     if (hoaM) data.hoaFee = hoaM[1];
   }
 
-  // Tax assessed value from Financial details section (listing sheet value)
   if (!data.taxAssessedValueListing) {
     const assessedM = fullText.match(/Tax assessed value[:\s]+\$([0-9,]+)/i);
     if (assessedM) data.taxAssessedValueListing = parseNum(assessedM[1]);
@@ -2473,7 +2038,6 @@ async function scrapeZillow(data) {
     if (annualM) data.taxAnnualAmountListing = parseNum(annualM[1]);
   }
 
-  // Tax history from page table if not captured
   if (!data.taxHistory?.length) {
     const taxRows = [];
     const taxTableM = fullText.matchAll(/(\d{4})\s+\$([0-9,]+)[\s+\-\.0-9%]*\s+\$([0-9,]+)/g);
@@ -2486,7 +2050,6 @@ async function scrapeZillow(data) {
     if (taxRows.length) data.taxHistory = taxRows;
   }
 
-  // Re-check tax conflict with text-scraped values
   if (!data.taxDataConflict && data.taxHistory?.length && data.taxAnnualAmountListing) {
     const latestPublic = data.taxHistory[0]?.taxPaid || 0;
     const listingVal   = parseNum(String(data.taxAnnualAmountListing));
@@ -2500,11 +2063,9 @@ async function scrapeZillow(data) {
   }
 
 
-  // Map rental fact fields into data.leaseTerms etc. when in rent mode
   if (data.listingMode === 'rent') {
     if (!data.leaseTerms    && data.leaseTermsText)    data.leaseTerms    = data.leaseTermsText;
     if (!data.petPolicy     && data.petPolicyText)     data.petPolicy     = data.petPolicyText;
-    // Also detect from DOM text patterns: "Cats, dogs OK" / "No pets"
     if (!data.petPolicy) {
       if (/cats?,\s*dogs?\s*ok/i.test(fullText))       data.petPolicy = 'Cats & dogs allowed';
       else if (/dogs?\s*ok/i.test(fullText))             data.petPolicy = 'Dogs allowed';
@@ -2526,11 +2087,9 @@ async function scrapeZillow(data) {
     if (!data.depositMin  && data.depositText)       data.depositMin       = parseNum(data.depositText);
     if (!data.applicationFee && data.applicationFeeText) data.applicationFee = parseNum(data.applicationFeeText);
     if (!data.utilitiesIncluded && data.utilitiesIncludedText) data.utilitiesIncluded = data.utilitiesIncludedText;
-    // Parking: use parking from scrapeFactsFromDOM
     if (!data.parkingType && data.parking)           data.parkingType = data.parking;
   }
 
-  // Agent from "Listing Provided by" text block — skip entirely for FSBO
   if (!data.agentName && !data.isFSBO) {
     const agentM  = fullText.match(/Listing Provided by:\s*\n?\s*([^\n,\d]+?)(?:\s+\d{3}[-\.\s]\d{3}[-\.\s]\d{4})?[\n,]/i);
     const brokerM = fullText.match(/([A-Z][A-Z\s&]+(?:REALTY|REALTORS|ASSOCIATES|GROUP|PROPERTIES|REAL ESTATE)[^\n,]{0,40})\s+\d{3}/);
@@ -2538,18 +2097,12 @@ async function scrapeZillow(data) {
     if (brokerM && !data.isFSBO) data.brokerageName = brokerM[1].trim();
   }
 
-  // Agent phone
   if (!data.agentPhone) {
     const phoneM = fullText.match(/(?:Listing Provided by|John Silva)[^\n]*?(\d{3}[-\.\s]\d{3}[-\.\s]\d{4})/i);
     if (phoneM) data.agentPhone = phoneM[1];
   }
 
-  // ── Property model extraction ─────────────────────────────────────────────
-  // Priority: __NEXT_DATA__ builderModel > Facts section > description patterns
-  // General approach: find a Title-Case proper noun adjacent to model/floor plan
-  // language. Exclude common English words that happen to be capitalized.
   if (!data.propertyModel) {
-    // Words that are NOT model names even if capitalized near "model"
     const excludeWords = new Set([
       'The','This','Our','Your','Its','Their','A','An','One','Two','Three',
       'New','Old','Open','Great','Large','Small','Single','Double','Master',
@@ -2561,24 +2114,21 @@ async function scrapeZillow(data) {
 
     let model = '';
 
-    // 1. Facts section: "Builder model: CLEARDEN" or "Builder model: Clearden"
     if (!model) {
       const factM = fullText.match(/Builder\s+model[:\s]+([A-Z][A-Za-z0-9\-]{2,20})/i);
       if (factM && !excludeWords.has(factM[1])) {
-        // Strip "Builder" word immediately — it's a Zillow data artifact
         model = factM[1].replace(/\s*Builder\b|Builder$/gi, '').trim();
       }
     }
 
-    // 2. Description: "The Clearden model" / "Clearden model is" / "Sandhill townhome"
     if (!model && data.description) {
       const patterns = [
-        /\bThe\s+([A-Z][a-z]{2,})\s+(?:model|floor\s*plan)\b/,     // "The Clearden model"
-        /\b([A-Z][a-z]{2,})\s+model\s+(?:is|offers|features|boasts)/i, // "Clearden model is"
-        /\b([A-Z][a-z]{2,})\s+(?:townhome|floor\s*plan)\b/i,        // "Sandhill townhome"
-        /\bour\s+([A-Z][a-z]{2,})\s+(?:model|plan)\b/i,             // "our Clearden model"
-        /\bpopular\s+([A-Z][a-z]{2,})\s+(?:model|plan)\b/i,         // "popular Clearden model"
-        /\bsought.after\s+([A-Z][a-z]{2,})\b/i,                     // "sought-after Clearden"
+        /\bThe\s+([A-Z][a-z]{2,})\s+(?:model|floor\s*plan)\b/,     
+        /\b([A-Z][a-z]{2,})\s+model\s+(?:is|offers|features|boasts)/i, 
+        /\b([A-Z][a-z]{2,})\s+(?:townhome|floor\s*plan)\b/i,        
+        /\bour\s+([A-Z][a-z]{2,})\s+(?:model|plan)\b/i,             
+        /\bpopular\s+([A-Z][a-z]{2,})\s+(?:model|plan)\b/i,         
+        /\bsought.after\s+([A-Z][a-z]{2,})\b/i,                     
       ];
       for (const re of patterns) {
         const m = data.description.match(re);
@@ -2586,10 +2136,7 @@ async function scrapeZillow(data) {
       }
     }
 
-    // 3. Broader description scan: any Title-Case word directly before/after
-    //    "model" or "floor plan" that isn't a common word
     if (!model && data.description) {
-      // Word BEFORE "model" or "floor plan"
       const beforeM = data.description.match(/([A-Z][a-z]{3,})\s+(?:model|floor\s*plan)\b/g);
       if (beforeM) {
         for (const hit of beforeM) {
@@ -2602,35 +2149,29 @@ async function scrapeZillow(data) {
     if (model) data.propertyModel = model.replace(/\s*Builder\b|Builder$/gi, '').trim();
   }
 
-  // Parcel number from page
   if (!data.parcelNumber) {
     const parcelM = fullText.match(/Parcel number[:\s]+([0-9\-]+)/i);
     if (parcelM) data.parcelNumber = parcelM[1].trim();
   }
 
-  // MLS details
   if (!data.mlsId) {
     const mlsM = fullText.match(/MLS#?[:\s]+([A-Z0-9]+)/i);
     if (mlsM) data.mlsId = mlsM[1];
   }
 
-  // Walk/bike scores from page text
   if (!data.walkScore) {
     const walkM = fullText.match(/Walk Score[®\s]*\n?\s*(\d+)/i);
     if (walkM) data.walkScore = walkM[1];
   }
 
-  // Days on market from page
   if (!data.daysOnMarket) {
     const domM = fullText.match(/(\d+)\s+days?\s+on\s+[Mm]arket|Cumulative days[:\s]+(\d+)/i);
     if (domM) data.daysOnMarket = parseInt(domM[1] || domM[2]);
   }
 
-  // Date listed
   const listDateM = fullText.match(/Date on market[:\s]+(\d{1,2}\/\d{1,2}\/\d{4})/i);
   if (listDateM) data.listDate = listDateM[1];
 
-  // Zestimate — DOM selector first (most reliable, works on sold listings too)
   if (!data.zestimate) {
     const zestEl = document.querySelector('[data-testid="primary-zestimate"]')
                 || document.querySelector('[class*="Zestimate"] [class*="Value"]')
@@ -2640,52 +2181,39 @@ async function scrapeZillow(data) {
       if (zv > 10000) data.zestimate = zv;
     }
   }
-  // Zestimate from page text fallback
   if (!data.zestimate) {
     const zestM = fullText.match(/Zestimate[®\s]*\n?\s*\$([0-9,]+)/i);
     if (zestM) { const zv = parseNum(zestM[1]); if (zv >= 10000) data.zestimate = zv; }
   }
 
-  // Zestimate range from page
   if (!data.zestimateRange?.low) {
     const zestRangeM = fullText.match(/Estimated sales range\s*\n?\s*\$([0-9,]+)\s*[-–]\s*\$([0-9,]+)/i);
     if (zestRangeM) data.zestimateRange = { low: parseNum(zestRangeM[1]), high: parseNum(zestRangeM[2]) };
   }
 
-  // Schools — robust GreatSchools parser (matches Zillow's actual Name→Grades→rating order)
   if (!data.schools?.length) {
     const parsed = parseSchoolsFromText(fullText);
     if (parsed.length) data.schools = parsed;
   }
 
-  // ── FEMA flood zone — "Flood zone: In FEMA Zone X (unshaded), a minimal-risk flood area" ──
-  // Used so risk flagging can stay quiet on minimal-risk (Zone X) properties and only
-  // surface flood-insurance concerns when the property is in an elevated/SFHA zone.
   if (!data.floodZone) {
     const fzM = fullText.match(/Flood zone\s*In FEMA Zone\s*([A-Z]{1,3})\b[^.\n]{0,40}?(minimal|moderate|high|elevated|severe)[\s-]*risk/i)
              || fullText.match(/FEMA Zone\s*([A-Z]{1,3})\b[^.\n]{0,40}?(minimal|moderate|high|elevated|severe)[\s-]*risk/i);
     if (fzM) {
       data.floodZone = fzM[1].toUpperCase();
-      data.floodRiskLevel = fzM[2].toLowerCase(); // minimal | moderate | high | elevated | severe
+      data.floodRiskLevel = fzM[2].toLowerCase(); 
     }
   }
 
-  // ── zpid from URL — needed for Zillow API calls ───────────────────────────
   const zpidM = location.href.match(/\/(\d+)_zpid/);
   data.zpid = zpidM ? zpidM[1] : '';
 
-  // ── MLS details — innerText has real newlines, more reliable than fullText ──
-  // HTML is source of truth — always overwrite NEXT_DATA for MLS#, source, agent
   const innerT = bodyInnerText;
-  // MLS# patterns: "MLS# O6365057", "MLS#: O6365057", "#O6365057", "# O6365057"
-  // Also try DOM elements with MLS-related text
   const mlsFromInnerT = innerT.match(/MLS\s*#\s*:?\s*([A-Z0-9]{5,15})\b/im)
              || innerT.match(/#\s*([A-Z][0-9]{5,12})\b/m)
              || innerT.match(/MLS\s*(?:ID|Number)[:\s]+([A-Z0-9]{5,15})\b/im);
   if (mlsFromInnerT) data.mlsId = mlsFromInnerT[1].trim();
-  // DOM scraper: walk elements containing "MLS" and extract the ID after # or :
   if (!data.mlsId || /^\d+$/.test(data.mlsId)) {
-    // Current mlsId is numeric-only (likely from NEXT_DATA internal ID) — try to find the proper one
     const allTextEls = document.querySelectorAll('span, div, p, li, td');
     for (const el of allTextEls) {
       if (el.children.length > 2) continue;
@@ -2698,18 +2226,15 @@ async function scrapeZillow(data) {
       }
     }
   }
-  // fullText last resort
   if (!data.mlsId || /^\d+$/.test(data.mlsId)) {
     const ftMls = fullText.match(/MLS\s*#\s*:?\s*([A-Z][0-9A-Z]{4,12})\b/i)
                || fullText.match(/#\s*([A-Z][0-9]{5,12})\b/);
     if (ftMls) data.mlsId = ftMls[1].trim();
   }
-  // Source: grab MLS name like "Stellar MLS" — skip city names, IDX junk
   const mlsSrcM = innerT.match(/Source:\s*(Stellar\s*MLS|MRED|CRMLS|HAR|NWMLS|[A-Z]{3,10}\s*MLS)\b/im)
                || innerT.match(/Source:\s*([^\n,]{3,30}?)(?:\s*(?:IDX|as distributed|information|provided|\n))/im);
   if (mlsSrcM) {
     const src = mlsSrcM[1].trim().replace(/\s+/g, ' ');
-    // Skip if it's just a city name
     if (!/^(?:Orlando|Miami|Tampa|Jacksonville|Chicago|New York|Los Angeles|Houston|Dallas|Phoenix)\s*$/i.test(src)) {
       data.mlsSource = src;
     }
@@ -2717,26 +2242,20 @@ async function scrapeZillow(data) {
   const originatingMlsM = fullText.match(/Originating MLS[:\s]+([^\n$,]+)/i);
   const rawOrigMls = originatingMlsM ? originatingMlsM[1].trim() : '';
   data.originatingMls = rawOrigMls.replace(/IDX.*$/i, '').replace(/information.*$/i, '').replace(/provided.*$/i, '').trim();
-  // Brokerage — "Listing courtesy of: Hannah Roesch ..., @properties Christie's..."
-  // Take the part after the comma (brokerage) not before (agent name)
   const courtesyM = innerT.match(/Listing\s+courtesy\s+of[:\s]+[^,]+,\s*([^\n]+)/i);
   if (courtesyM) {
     const raw = courtesyM[1].trim();
-    // Stop before "Source:", phone number, or MLS reference
     data.brokerageName = raw.replace(/\s*(?:Source:|MLS|\d{3}[-.]\d{3}).*/i, '').trim();
   }
 
-  // For FSBO: clear any agent/brokerage that leaked through DOM scraping
   if (data.isFSBO) {
     data.agentName     = '';
     data.brokerageName = '';
   }
 
-  // ── Days on market — calculate ourselves from listDate + today ────────────
   if (!data.listDate) {
     const listDateM2 = fullText.match(/Date on market[:\s]+(\d{1,2}\/\d{1,2}\/\d{4})/i);
     if (listDateM2) data.listDate = listDateM2[1];
-    // Also try price history — most recent "Listed for sale" date
     if (!data.listDate && data.priceHistory?.length) {
       const latestListing = data.priceHistory.find(h => /listed/i.test(h.event || h.priceChangeType || ''));
       if (latestListing) data.listDate = latestListing.date;
@@ -2751,13 +2270,11 @@ async function scrapeZillow(data) {
       if (diffDays >= 0 && diffDays < 3650) data.daysOnMarket = diffDays;
     } catch(e) {}
   }
-  // DOM fallback for DOM
   if (!data.daysOnMarket) {
     const domM2 = fullText.match(/(\d+)\s+days?\s+on\s+Zillow|Cumulative days[^:]*:[^\d]*(\d+)/i);
     if (domM2) data.daysOnMarket = parseInt(domM2[1] || domM2[2]);
   }
 
-  // ── Tax history — read the actual HTML table ──────────────────────────────
   if (!data.taxHistory?.length) {
     try {
       const tables = document.querySelectorAll('table');
@@ -2789,7 +2306,6 @@ async function scrapeZillow(data) {
     } catch(e) {}
   }
 
-  // ── Re-check tax conflict with freshly scraped values ─────────────────────
   if (!data.taxDataConflict) {
     const latestPublic = data.taxHistory?.[0]?.taxPaid || 0;
     const listingVal   = parseNum(String(data.taxAnnualAmountListing || 0));
@@ -2802,10 +2318,7 @@ async function scrapeZillow(data) {
     }
   }
 
-  // ── Photos ────────────────────────────────────────────────────────────────
   const photos = extractPhotos();
-  // photoCount must reflect the LISTING's true photo count, not the handful of hero
-  // URLs extractPhotos() returns for the floor-plan vision feature.
   data.photoCount = countListingPhotos(fullText) || photos.length || 0;
   data.photoUrls  = photos.slice(0, 5);
   if (!data.photoCount) {
@@ -2813,9 +2326,6 @@ async function scrapeZillow(data) {
     if (photoM) data.photoCount = parseInt(photoM[1]);
   }
 
-  // ── AI photo detection ─────────────────────────────────────────────────────
-  // Zillow labels AI-enhanced, virtual staged, or AI-generated photos in caption text
-  // and occasionally in badge text on the photo carousel.
   const aiPhotoSignals = [
     /AI.{0,10}enhanc/i, /virtual.{0,5}stag/i, /digitally.{0,10}stag/i,
     /AI.{0,10}generat/i, /rendered/i, /artist.{0,10}render/i,
@@ -2826,35 +2336,26 @@ async function scrapeZillow(data) {
   )).map(el => el.textContent).join(' ') + ' ' + fullText.slice(0, 3000);
   data.hasAiPhotos = aiPhotoSignals.some(re => re.test(photoText));
 
-  // ── FSBO — only valid for active buy listings, never sold/rent ─────────────
-  // The Zillow nav always contains "For sale by owner" as a menu item — don't match that.
-  // Require FSBO signals to appear near the listing price/header, not in nav.
   if (data.listingMode === 'buy') {
-    // Check nd first (most reliable)
     if (!data.isFSBO && nd) {
       data.isFSBO = !!(nd.isForSaleByOwner);
     }
-    // Fallback: look for FSBO badge in the listing header area (after nav)
-    // The listing header is typically after the first 1000 chars (past nav)
     if (!data.isFSBO) {
       const bodySnip = fullText.slice(1000, 5000);
       data.isFSBO = /^for sale by owner$/im.test(bodySnip) || /fsbo/i.test(bodySnip);
     }
   }
 
-  // ── Parcel number ─────────────────────────────────────────────────────────
   if (!data.parcelNumber) {
     const parcelM2 = fullText.match(/Parcel number[:\s]+([0-9\-A-Z]+)/i);
     if (parcelM2) data.parcelNumber = parcelM2[1].trim();
   }
 
-  // ── Walk/bike scores ──────────────────────────────────────────────────────
   if (!data.walkScore) {
     const walkM2 = fullText.match(/Walk Score[®\s]*\n?\s*(\d+)/i);
     if (walkM2) data.walkScore = walkM2[1];
   }
 
-  // ── Zestimate ─────────────────────────────────────────────────────────────
   if (!data.zestimate) {
     const zestEl2 = document.querySelector('[data-testid="primary-zestimate"]')
                  || document.querySelector('[data-testid="zestimate-value"]');
@@ -2872,14 +2373,11 @@ async function scrapeZillow(data) {
     if (zrM) data.zestimateRange = { low: parseNum(zrM[1]), high: parseNum(zrM[2]) };
   }
 
-  // ── Schools — robust GreatSchools parser ────────────────────────────────────
   if (!data.schools?.length) {
     const parsed = parseSchoolsFromText(fullText);
     if (parsed.length) data.schools = parsed;
   }
 
-  // ── Agent & brokerage — HTML is source of truth, always overwrite NEXT_DATA ─
-  // "Listing courtesy of: Hannah Roesch 847-381-0300, @properties Christie's..."
   const innerText2 = bodyInnerText;
   const courtesyM2 = innerText2.match(/Listing\s+courtesy\s+of[:\s]+([^,\n\d]{3,60}?)(?=\s*\d{3}[-.\s]\d{3}|\s*,|\n|$)/i);
   const courtesyBrokerM = innerText2.match(/Listing\s+courtesy\s+of[:\s]+[^,]+,\s*([^\n]+)/i);
@@ -2893,16 +2391,13 @@ async function scrapeZillow(data) {
     if (phoneM2) data.agentPhone = phoneM2[1];
   }
 
-  // ── Property model ────────────────────────────────────────────────────────
   if (!data.propertyModel && data.description) {
     const modelM2 = data.description.match(/([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\s+(?:townhome|model|floor\s*plan)/i);
     if (modelM2) data.propertyModel = modelM2[1].replace(/\s*Builder\b|Builder$/gi, '').trim();
   }
 
-  // ── Nearby comps from DOM carousel ───────────────────────────────────────
   data.comparables = extractComps();
 
-  // ── Sold date — DOM fallback for date-info element ─────────────────────────
   if (data.listingMode === 'sold' && !data.dateSold) {
     const dateEl = document.querySelector('[data-testid="date-info"]');
     if (dateEl) {
@@ -2915,13 +2410,9 @@ async function scrapeZillow(data) {
     }
   }
 
-  // priceHistory set inline from __NEXT_DATA__ above
 
-  // Price history — parsed after expandPriceHistory() runs in the click handler
   data.priceHistory = await parsePriceHistoryFromPage();
 
-  // ── nd fallback for previous sale (when "Show more" only gives partial rows) ─
-  // nd.lastSoldPrice + nd.lastSoldDate are in __NEXT_DATA__ even for sold listings
   if (nd && data.priceHistory.length > 0) {
     const hasPrevSale = data.priceHistory.filter(h => /^sold$/i.test((h.event||'').trim())).length >= 2;
     if (!hasPrevSale && nd.lastSoldPrice && nd.lastSoldDate) {
@@ -2942,22 +2433,17 @@ async function scrapeZillow(data) {
     }
   }
 
-  // ── Sold date from first Sold event in priceHistory ──────────────────────
   if (data.listingMode === 'sold' && !data.dateSold && data.priceHistory.length > 0) {
     const soldEv = data.priceHistory.find(h => /^sold$/i.test((h.event||'').trim()));
     if (soldEv) data.dateSold = soldEv.date;
   }
 
-  // ── Scrape nearby homes + schools (page already scrolled/expanded) ────────
-  data.priceHistory = sortHistory(data.priceHistory); // final sort after all nd entries appended
+  data.priceHistory = sortHistory(data.priceHistory); 
   data.nearbyHomes   = scrapeNearbyHomes();
-  // Reliability: the "Similar homes" carousel often unmounts by the time we re-read it
-  // here, so fall back to the copy captured during the scroll.
   if ((!data.nearbyHomes || !data.nearbyHomes.length) && _chNearbyHomes.length) {
     data.nearbyHomes = _chNearbyHomes;
   }
 
-  // Merge extractComps() results into nearbyHomes (dedup by address)
   if (data.comparables?.length > 0) {
     const seenAddr = new Set(data.nearbyHomes.map(h => (h.addr || h.address || '').toLowerCase().replace(/[^a-z0-9]/g,'')));
     for (const c of data.comparables) {
@@ -2976,16 +2462,12 @@ async function scrapeZillow(data) {
     }
   }
 
-  // Filter comps to the SAME bedroom count as the subject, then order by closest
-  // bathrooms, then closest square footage (bath/sqft similarity takes priority).
   if (Array.isArray(data.nearbyHomes) && data.nearbyHomes.length) {
     const subjBeds  = parseNum(String(data.beds || 0));
     const subjBaths = parseFloat(String(data.baths || 0)) || 0;
     const subjSqft  = parseNum(String(data.sqft || 0));
     if (subjBeds > 0) {
       const sameBeds = data.nearbyHomes.filter(h => (h.bedsNum || 0) === subjBeds);
-      // Only narrow to same-bed comps if we actually found some; otherwise keep all
-      // rather than show an empty section.
       if (sameBeds.length) data.nearbyHomes = sameBeds;
     }
     data.nearbyHomes.sort((a, b) => {
@@ -2996,22 +2478,17 @@ async function scrapeZillow(data) {
   }
   data.nearbySchools = scrapeNearbySchools();
 
-  // School scraping fallback — robust GreatSchools parser if DOM scraper got nothing
   if (!data.nearbySchools?.length) {
     const parsed = parseSchoolsFromText(fullText);
     data.nearbySchools = parsed.map(s => ({ rating: s.rating, name: s.name, grades: s.grades, dist: s.distance }));
   }
 
-  // Keep data.schools (NEXT_DATA path) and data.nearbySchools (DOM path) consistent.
-  // If NEXT_DATA didn't populate schools but the DOM scrape found them, mirror across
-  // so every downstream consumer sees the ratings. Normalize dist→distance.
   if ((!Array.isArray(data.schools) || !data.schools.length) && data.nearbySchools?.length) {
     data.schools = data.nearbySchools.map(s => ({
       name: s.name, rating: s.rating, grades: s.grades || '', distance: s.distance || s.dist || ''
     }));
   }
 
-  // ── Staging hooks for background fetch ───────────────────────────────────
   data.agentLicenseLookup = {
     state: 'FL', name: data.agentName, brokerage: data.brokerageName, phone: data.agentPhone
   };
@@ -3019,24 +2496,16 @@ async function scrapeZillow(data) {
     data.countyLookup = { county: 'Orange County, FL', parcel: data.parcelNumber };
   }
 
-  // ── LAST SOLD PRICE — second pass from DOM priceHistory (source of truth) ──
-  // parsePriceHistoryFromPage() runs after the NEXT_DATA block, so this pass
-  // catches sold events that NEXT_DATA missed on rental pages.
-  // Policy: priceHistory DOM is top-tier source of truth for sold price.
   if (!data.lastSoldPrice || data.lastSoldPrice === 0) {
     const soldEvDom = (data.priceHistory || []).find(h =>
       /^sold$/i.test((h.event || h.priceChangeType || '').trim()) && h.price > 50000
     );
     if (soldEvDom) data.lastSoldPrice = Number(soldEvDom.price);
   }
-  // Also try nd.lastSoldPrice directly as final fallback
   if ((!data.lastSoldPrice || data.lastSoldPrice === 0) && nd?.lastSoldPrice > 50000) {
     data.lastSoldPrice = Number(nd.lastSoldPrice);
   }
 
-  // ── RENT ZESTIMATE — DOM scrape post-scroll (source of truth) ──────────────
-  // [data-testid="rent-zestimate"] renders after page scroll/expand.
-  // Always prefer this over NEXT_DATA which is often absent for buy/sold pages.
   try {
     const rzEl = document.querySelector('[data-testid="rent-zestimate"]');
     if (rzEl) {
@@ -3044,26 +2513,20 @@ async function scrapeZillow(data) {
       const rzM = rzText.match(/\$([0-9,]+)/);
       if (rzM) {
         const rzVal = parseInt(rzM[1].replace(/,/g, ''), 10);
-        if (rzVal >= 500 && rzVal <= 50000) data.rentZestimate = rzVal; // overwrite NEXT_DATA
+        if (rzVal >= 500 && rzVal <= 50000) data.rentZestimate = rzVal; 
       }
     }
   } catch(e) {}
 
-  // ── RENT PRICE FINAL SEAL ─────────────────────────────────────────────────
-  // After all scraping, if this is a rental listing, run scrapeListingPrice('rent')
-  // one final time and hard-lock data.price and data.rentPrice to the result.
-  // This overrides any sale price, NEXT_DATA noise, or fallback that slipped through.
   if (data.listingMode === 'rent') {
     const sealedRentPrice = scrapeListingPrice('rent');
     if (sealedRentPrice > 0 && sealedRentPrice <= 50000) {
       data.price     = sealedRentPrice;
       data.rentPrice = sealedRentPrice;
     } else if (data.rentZestimate > 0) {
-      // DOM didn't find it — use rentZestimate as fallback, never the sale price
       data.price     = data.rentZestimate;
       data.rentPrice = data.rentZestimate;
     } else {
-      // Last resort: scan priceHistory for a rent event
       const rentEv = (data.priceHistory || []).find(h => {
         const ev = (h.event || h.priceChangeType || '').toLowerCase();
         return /listed.*rent|price.*change|reduced/i.test(ev) && h.price >= 500 && h.price <= 50000;
@@ -3072,16 +2535,12 @@ async function scrapeZillow(data) {
     }
   }
 
-  // ── Final model clean — always strip "Builder" suffix and builder company prefix ──
   if (data.propertyModel) {
-    // Strip any occurrence of the word "Builder" (standalone or as suffix)
     data.propertyModel = data.propertyModel.replace(/\s*Builder\b/gi, '').trim();
-    // Strip builder company prefix if builderName is known
     if (data.builderName) {
       const esc = data.builderName.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       data.propertyModel = data.propertyModel.replace(new RegExp('^' + esc + '\\s*', 'i'), '').trim();
     }
-    // Final pass: strip any remaining "Builder" word fragments
     data.propertyModel = data.propertyModel.replace(/^Builder\s*/i, '').trim();
   }
 
@@ -3089,7 +2548,6 @@ async function scrapeZillow(data) {
 }
 
 function scrapeRedfin(data) {
-  // Try __NEXT_DATA__ first
   try {
     const el = document.getElementById('__NEXT_DATA__');
     if (el) {
@@ -3107,7 +2565,6 @@ function scrapeRedfin(data) {
     }
   } catch(e) {}
 
-  // DOM fallbacks
   if (!data.address) {
     const el = document.querySelector('.street-address, [class*="address"] h1, h1[class*="homeAddress"]');
     if (el) data.address = el.innerText?.trim();
@@ -3128,9 +2585,6 @@ function scrapeRedfin(data) {
     if (el) data.description = el.innerText?.trim();
   }
 
-  // Agent — fallback ONLY: never overwrite a name we already extracted, and never
-  // write an empty/garbage value (Zillow's listing-agent element is unmounted/blank
-  // after scroll-to-top, which previously clobbered the correctly-scraped name).
   if (!data.agentName) {
     const agentEl = document.querySelector('[class*="agentName"], [class*="listing-agent"]');
     const v = (agentEl && agentEl.innerText ? agentEl.innerText.trim() : '');
@@ -3144,7 +2598,6 @@ function scrapeRedfin(data) {
 }
 
 function scrapeRealtor(data) {
-  // Try JSON-LD structured data first (realtor.com embeds it)
   try {
     const jsonLDs = document.querySelectorAll('script[type="application/ld+json"]');
     for (const s of jsonLDs) {
@@ -3160,15 +2613,12 @@ function scrapeRealtor(data) {
     }
   } catch(e) {}
 
-  // DOM fallbacks
   if (!data.address) {
     const el = document.querySelector('h1[class*="address"], [data-testid="address"] h1, h1');
     if (el) data.address = el.innerText?.trim();
   }
 
-  // Price history populated in scrapeZillow below
 
-  // dateSold handled in scrapeZillow
 
   if (!data.price) {
     const el = document.querySelector('[data-testid="list-price"], [class*="price"] [class*="price"]');
@@ -3181,9 +2631,9 @@ function scrapeRealtor(data) {
   if (bedsEl && !data.beds)   data.beds  = parseNum(bedsEl.innerText);
   if (bathsEl && !data.baths) {
     const bt = (bathsEl.innerText || bathsEl.textContent || '').trim();
-    const bFrac = bt.match(/^(\d+)\s+1\/2$|^(\d+)½$/);  // '2 1/2' or '2½'
-    const bDec  = bt.match(/^(\d+\.\d)$/);                // '2.5'
-    const bInt  = bt.match(/^(\d+)$/);                      // '3'
+    const bFrac = bt.match(/^(\d+)\s+1\/2$|^(\d+)½$/);  
+    const bDec  = bt.match(/^(\d+\.\d)$/);                
+    const bInt  = bt.match(/^(\d+)$/);                      
     let bv = 0;
     if (bFrac) bv = parseInt(bFrac[1] || bFrac[2], 10) + 0.5;
     else if (bDec) bv = parseFloat(bt);
@@ -3197,8 +2647,6 @@ function scrapeRealtor(data) {
     if (el) data.description = el.innerText?.trim();
   }
 
-  // Agent/brokerage — HTML is source of truth, always overwrite NEXT_DATA
-  // 'Listing courtesy of: Hannah Roesch 847-381-0300, @properties Christie's...'
   const bodyText = document.body.innerText;
   const agentCourtM  = bodyText.match(/Listing\s+courtesy\s+of[:\s]+([^,\n\d]{3,60}?)(?=\s*\d{3}[-.\ s]\d{3}|\s*,|\n|$)/i);
   const brokerCourtM = bodyText.match(/Listing\s+courtesy\s+of[:\s]+[^,]+,\s*([^\n]+)/i);
@@ -3208,7 +2656,6 @@ function scrapeRealtor(data) {
       .replace(/\s*(?:Source:|MLS|\d{3}[-.\ s]\d{3}|\$\d).*/i, '').trim();
   }
 
-  // Year built, lot size from page text
   const ybM  = bodyText.match(/(?:year\s*built|built\s*in)[:\s]+(\d{4})/i);
   const lotM = bodyText.match(/lot\s*size[:\s]+([\d,\.]+\s*(?:sq\s*ft|acres?))/i);
   const hoaM = bodyText.match(/hoa[:\s\$]+([\d,]+)\s*(?:\/mo|per month|monthly)?/i);
@@ -3220,19 +2667,13 @@ function scrapeRealtor(data) {
   return data;
 }
 
-// ── Dedicated price scraper — DOM-first, works for regular and Showcase listings ─
 function scrapeListingPrice(listingMode) {
-  // listingMode: 'buy' | 'sold' | 'rent' — passed by callers who already know the mode.
-  // If not provided, fall back to detecting from DOM/JSON.
 
-  // ── Method 1: DOM — exact class patterns from Zillow's rendered HTML ─────
   const excludedParents = [
     '[class*="carousel"]', '[class*="similar"]', '[class*="nearby"]',
     '[class*="recommendation"]', '[class*="Zestimate"]', '[class*="zestimate"]',
   ];
 
-  // Rental listings show monthly prices ($500-$15K) — use lower threshold.
-  // Trust the passed listingMode first; fall back to a quick DOM check.
   const isRentCtx = listingMode === 'rent'
     || (!listingMode && (
          /FOR_RENT/i.test(document.getElementById('__NEXT_DATA__')?.textContent?.slice(0,2000) || '')
@@ -3241,24 +2682,18 @@ function scrapeListingPrice(listingMode) {
   const minP = isRentCtx ? 500   : 100000;
   const maxP = isRentCtx ? 50000 : 100000000;
 
-  // For rent context: find the /mo span directly — most reliable signal on Zillow
-  // DOM structure: <span>$3,550<span class="...">/mo</span></span>
   if (isRentCtx) {
     try {
-      // Find every /mo span on the page, walk up to find the price number
       const allSpans = document.querySelectorAll('span');
       for (const sp of allSpans) {
         const txt = (sp.textContent || '').trim();
         if (txt !== '/mo') continue;
-        // Found a /mo span — price is in the parent
         const parent = sp.parentElement;
         if (!parent) continue;
         if (excludedParents.some(ep => parent.closest(ep))) continue;
-        // Get just the text nodes (not the /mo child) from parent
         const parentText = parent.textContent || '';
         const v = parsePriceToken(parentText);
         if (v >= 500 && v <= 50000) return v;
-        // Try grandparent
         const gp = parent.parentElement;
         if (gp) {
           const gpText = gp.textContent || '';
@@ -3270,17 +2705,13 @@ function scrapeListingPrice(listingMode) {
   }
 
   const domSelectors = [
-    // Exact known classes from Zillow's rendered HTML (most specific first)
-    '.price-text',                               // standard listings
-    '[data-testid="price"]',                     // data-testid anchor
-    'span[class*="PriceText"]',                  // Showcase StyledPriceText
-    'span[class*="price-text"]',                 // lowercase variant
-    '[class*="summary-container"] .price-text',  // summary wrapper
-    // NOTE: broad span[class*="Price"] removed — matches wrapper elements
-    // whose innerText includes adjacent bed/bath numbers causing e.g. $819,0003.5
+    '.price-text',                               
+    '[data-testid="price"]',                     
+    'span[class*="PriceText"]',                  
+    'span[class*="price-text"]',                 
+    '[class*="summary-container"] .price-text',  
   ];
 
-  // parsePriceToken: extracts ONLY the first $X,XXX number — never appends adjacent text
   const parsePriceToken = (text) => {
     if (!text) return 0;
     const m = text.match(/\$\s*([1-9][\d,]*)/);
@@ -3293,8 +2724,6 @@ function scrapeListingPrice(listingMode) {
       const els = document.querySelectorAll(sel);
       for (const el of els) {
         if (excludedParents.some(ep => el.closest(ep))) continue;
-        // Use textContent of the element itself, not innerText of parent
-        // This avoids picking up sibling text (beds, baths, sqft) that follows
         const text = el.textContent || el.innerText || '';
         const v = parsePriceToken(text);
         if (v >= minP && v <= maxP) return v;
@@ -3302,8 +2731,6 @@ function scrapeListingPrice(listingMode) {
     } catch(e) {}
   }
 
-  // Sold listings: DOM shows "Sold for $X" near the top — catch it here
-  // Skip entirely when in rent context — sold price in price history would be a false match
   if (!isRentCtx) {
     try {
       const bodyTop = document.body.innerText.slice(0, 2000);
@@ -3315,26 +2742,18 @@ function scrapeListingPrice(listingMode) {
     } catch(e) {}
   }
 
-  // ── Method 2: __NEXT_DATA__ — use priceHistory as the reliable source ────
-  // priceHistory is populated correctly even when nd.price is stale/wrong.
   const zpidM   = location.pathname.match(/\/(\d+)_zpid/);
   const urlZpid = zpidM ? zpidM[1] : null;
 
   const getPriceFromHistory = (obj) => {
     const ph = obj?.priceHistory;
     if (!Array.isArray(ph) || !ph.length) return 0;
-    // priceHistory is newest-first. First entry = current state.
-    // For RENT: top entry is "Listed for rent" or "Price change" with the monthly rent.
-    // For SALE: top entry is "Listed for sale" or "Price change" with the list price.
-    // For SOLD: look for the "Sold" event.
     const top = ph[0];
     const topEv = (top?.event || top?.priceChangeType || '').toLowerCase().trim();
-    // Rent: listed for rent OR price change on a rental (price will be monthly $500-$15K)
     if (isRentCtx) {
       if (/listed.*rent|price.*change|reduced/i.test(topEv) && top?.price >= 500 && top?.price <= 15000) {
         return Number(top.price);
       }
-      // Scan all entries for most recent rent-related event
       for (const h of ph) {
         const ev = (h.event || h.priceChangeType || '').toLowerCase();
         if (/listed.*rent|price.*change|reduced/i.test(ev) && h.price >= 500 && h.price <= 15000) {
@@ -3342,12 +2761,10 @@ function scrapeListingPrice(listingMode) {
         }
       }
     }
-    // Active sale listing: most recent "listed for sale" or price change
     const listed = ph.find(h =>
       /listed\s+for\s+sale|^listed$/i.test(h.event || h.priceChangeType || '')
     );
     if (listed?.price > 100000) return Number(listed.price);
-    // Sold listings: most recent "sold" event
     const sold = ph.find(h =>
       /^sold$/i.test((h.event || h.priceChangeType || '').trim())
     );
@@ -3360,7 +2777,6 @@ function scrapeListingPrice(listingMode) {
     if (!el) return 0;
     const props = JSON.parse(el.textContent)?.props?.pageProps;
 
-    // gdpClientCache — prefer zpid-matching key
     const gdp = props?.gdpClientCache;
     if (gdp) {
       const keys       = Object.keys(gdp);
@@ -3372,7 +2788,6 @@ function scrapeListingPrice(listingMode) {
           const inner = JSON.parse(gdp[key]);
           const nd    = inner?.property || inner?.gdp || inner;
           if (!nd) continue;
-          // Skip if zpid explicitly mismatches
           if (nd.zpid && urlZpid && String(nd.zpid) !== urlZpid) continue;
           const ph = getPriceFromHistory(nd);
           if (ph > 0) return ph;
@@ -3382,7 +2797,6 @@ function scrapeListingPrice(listingMode) {
       }
     }
 
-    // aboveTheFold (Showcase)
     const atf = props?.aboveTheFold?.homeData || props?.aboveTheFold;
     if (atf && (!urlZpid || !atf.zpid || String(atf.zpid) === urlZpid)) {
       const ph = getPriceFromHistory(atf);
@@ -3399,14 +2813,12 @@ function maybeAnalyze() {
   if (location.href === lastAnalyzedUrl) return;
   if (analysisInProgress) return;
 
-  // Only show trigger once URL is settled on a homedetails page
-  // and __NEXT_DATA__ is present (Zillow SPA may still be rendering)
   const waitForReady = (attempts = 0) => {
-    if (!isListingPage() || location.href !== lastUrl) return; // navigated away
+    if (!isListingPage() || location.href !== lastUrl) return; 
     const nd = document.getElementById('__NEXT_DATA__');
     const hasData = nd && nd.textContent.includes('"zpid"');
     if (hasData || attempts >= 12) {
-      setTimeout(showManualTrigger, 400);
+      setTimeout(announceListing, 400);
     } else {
       setTimeout(() => waitForReady(attempts + 1), 300);
     }
@@ -3414,10 +2826,7 @@ function maybeAnalyze() {
   setTimeout(() => waitForReady(), 800);
 }
 
-// ── Fast listing mode hint — runs before full scrapeListing() ─────────────────
-// Priority: 0) Price history top event → 1) NEXT_DATA → 2) DOM elements → 3) Text
 function detectListingModeQuick() {
-  // ── 0. Price history — definitive if "Sold" is the most recent event ──
   try {
     const bodyText = document.body.innerText.slice(0, 3000);
     const phMatch = bodyText.match(/Price history[\s\S]{0,200}/i)?.[0] || '';
@@ -3430,7 +2839,6 @@ function detectListingModeQuick() {
     }
   } catch(e) {}
 
-  // ── 1. NEXT_DATA homeStatus ──
   try {
     const ndEl = document.getElementById('__NEXT_DATA__');
     if (ndEl) {
@@ -3446,7 +2854,6 @@ function detectListingModeQuick() {
     }
   } catch(e) {}
 
-  // ── 2. DOM status badge — look for listing status text near top ──
   try {
     const statusEls = document.querySelectorAll('span, div');
     const limit = Math.min(statusEls.length, 150);
@@ -3461,12 +2868,10 @@ function detectListingModeQuick() {
     }
   } catch(e) {}
 
-  // ── 3. Page text — skip first 200 chars (nav contains "For sale" links) ──
   try {
     const hdr = document.body.innerText.slice(0, 1500);
-    const afterNav = hdr.slice(200); // skip nav pollution
+    const afterNav = hdr.slice(200); 
 
-    // Rent: $X,XXX/mo price format is definitive
     if (/\$[\d,]+\s*\/\s*mo/i.test(afterNav.slice(0, 600))) return 'rent';
     if (/(?:house|home|apartment|condo|townhouse|single.?family|duplex)\s+for\s+rent/im.test(afterNav)) return 'rent';
     if (/off\s*market/im.test(afterNav))                          return 'sold';
@@ -3479,21 +2884,48 @@ function detectListingModeQuick() {
 }
 
 
-function showManualTrigger() {
-  if (!isListingPage() || panelHost || analysisInProgress) return;
-  if (location.href === lastAnalyzedUrl) return;
+function chLooksLikeAddress(s) {
+  if (!s) return false;
+  if (/real estate|homes? for sale|apartments? for rent|for rent|zillow|\brentals?\b/i.test(s)) return false;
+  return /^\d+[\w-]*\s+\S/.test(s.trim());
+}
 
-  // Fast mode detection — runs in <5ms, no DOM iteration, no blob scan.
-  // Full scrapeListing() only runs when user clicks Analyze.
-  const quickMode = detectListingModeQuick();
+const CH_ST_SUFFIX = /^(rd|road|st|street|ave|avenue|dr|drive|ln|lane|ct|court|blvd|boulevard|way|pl|place|ter|terrace|cir|circle|loop|trl|trail|pkwy|parkway|hwy|highway|run|path|pt|point|sq|square|xing|crossing|cv|cove|bnd|bend|walk|row|aly|alley)$/i;
 
-  // Quick price — pass quick mode so rent threshold is correct
+function chUrlAddressSlug() {
+  const m = location.pathname.match(/\/homedetails\/([^/]+)\/\d+_zpid/);
+  return m ? m[1] : '';
+}
+
+function chAddressFromUrl() {
+  const slug = chUrlAddressSlug();
+  if (!slug) return '';
+  const parts = slug.split('-');
+  if (!/^\d/.test(parts[0])) return '';
+  for (let i = 1; i < parts.length; i++) {
+    if (CH_ST_SUFFIX.test(parts[i])) return parts.slice(0, i + 1).join(' ');
+  }
+  return '';
+}
+
+function chAddrMatchesUrl(s) {
+  const slug = chUrlAddressSlug();
+  if (!slug) return true;                       
+  const norm = (x) => x.toLowerCase().replace(/[.,]/g, '').replace(/\s+/g, ' ').trim();
+  return norm(slug.replace(/-/g, ' ')).startsWith(norm(s));
+}
+
+function chQuickAddress() {
+  const t = (document.title.match(/^([^|,]+)/) || [])[1]?.trim() || '';
+  if (chLooksLikeAddress(t) && chAddrMatchesUrl(t)) return t;
+  return chAddressFromUrl();
+}
+
+function chQuickListing() {
+  const quickMode  = detectListingModeQuick();
   const quickPrice = scrapeListingPrice(quickMode);
-
-  // Minimal trigger data — just enough for the panel label
-  // For rent: store as rentPrice (locked) so full scrape cannot overwrite with sale price
   const quickData = {
-    address:     (document.title.match(/^([^|,]+)/) || [])[1]?.trim() || '',
+    address:     chQuickAddress(),
     price:       quickMode === 'rent' ? 0 : quickPrice,
     rentPrice:   quickMode === 'rent' ? quickPrice : 0,
     listingMode: quickMode,
@@ -3502,143 +2934,92 @@ function showManualTrigger() {
     isFSBO:      false,
     isOffMarket: false,
   };
-  // Detect off-market from DOM signals
   const bodySlice = document.body.innerText.slice(0, 800);
   if (/off\s*market/im.test(bodySlice) || (/Zestimate®/i.test(bodySlice) && !/^For sale$/m.test(bodySlice))) {
     quickData.listingMode = 'sold';
     quickData.isOffMarket = true;
   }
-  // For sold listings, try to get sold price from the header text
   if (quickData.listingMode === 'sold') {
     const m = bodySlice.match(/Sold (?:for |on )?\$([\d,]+)/i);
     if (m) { quickData.soldPrice = parseInt(m[1].replace(/,/g,''), 10); quickData.price = quickData.soldPrice; }
   }
+  return quickData;
+}
 
-  panelHost = document.createElement('div');
-  panelHost.id = 'clear-home-host';
-  document.body.appendChild(panelHost);
+function announceListing(attempt = 0) {
+  if (!isListingPage() || !clearHomeEnabled) { sendToPanel({ type: 'CH_NO_LISTING' }); return; }
+  if (analysisInProgress) return;
 
-  const shadow = panelHost.attachShadow({ mode: 'open' });
+  const q    = chQuickListing();
+  if (!q.address && attempt < 8) setTimeout(() => announceListing(attempt + 1), 700);
+  const mode = q.listingMode;
+  const raw  = mode === 'rent' ? (q.rentPrice || 0) : (q.soldPrice || q.price || 0);
+  const label = mode === 'sold' ? (q.isOffMarket ? 'Last Sold ' : 'Sold ') : mode === 'rent' ? 'Rent ' : '';
 
-  const fontLink = document.createElement('link');
-  fontLink.rel = 'stylesheet';
-  fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap';
-  shadow.appendChild(fontLink);
-
-  const style = document.createElement('style');
-  style.textContent = getPanelStyles();
-  shadow.appendChild(style);
-
-  const panelEl = document.createElement('div');
-  panelEl.id = 'ch-panel';
-  panelEl.innerHTML = getManualTriggerHTML(quickData);
-  shadow.appendChild(panelEl);
-  homePanel = panelEl;
-
-  applyTheme(currentTheme);
-  requestAnimationFrame(() => requestAnimationFrame(() => panelEl.classList.add('visible')));
-
-  // ── Drag to reposition ───────────────────────────────────────────────────
-  const trigHeader = shadow.querySelector('.ch-header');
-  if (trigHeader && panelHost) {
-    let _drag = false, _sx, _sy, _sl, _st;
-    trigHeader.addEventListener('mousedown', (e) => {
-      if (e.target.closest('button')) return;
-      _drag = true; _sx = e.clientX; _sy = e.clientY;
-      const r = panelHost.getBoundingClientRect();
-      _sl = r.left; _st = r.top;
-      panelHost.style.right = 'auto'; panelHost.style.bottom = 'auto';
-      panelHost.style.left = _sl+'px'; panelHost.style.top = _st+'px';
-      e.preventDefault();
-    });
-    document.addEventListener('mousemove', (e) => {
-      if (!_drag) return;
-      panelHost.style.left = Math.max(0, Math.min(window.innerWidth  - panelHost.offsetWidth,  _sl + e.clientX - _sx)) + 'px';
-      panelHost.style.top  = Math.max(0, Math.min(window.innerHeight - panelHost.offsetHeight, _st + e.clientY - _sy)) + 'px';
-    });
-    document.addEventListener('mouseup', () => { _drag = false; });
-  }
-
-  // Close — hide panel but keep it in DOM so icon-click can restore it
-  shadow.querySelector('#ch-close')?.addEventListener('click', () => {
-    panelEl.classList.remove('visible');
-    // Don't destroy — icon click will bring it back
-  });
-
-  // Settings gear — open settings.html in a new tab
-  shadow.querySelector('#ch-settings-btn')?.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'OPEN_SETTINGS' });
-  });
-
-  // Run analysis — scroll to bottom → expand all Show More → scrape → analyze
-  shadow.querySelector('#ch-run-analysis')?.addEventListener('click', async () => {
-    const runBtn = shadow.querySelector('#ch-run-analysis');
-    const setStatus = (t) => { if (runBtn) runBtn.textContent = t; };
-
-    if (runBtn) { runBtn.disabled = true; }
-    setStatus('Checking settings…');
-
-    // Gate: verify API key BEFORE any scrolling or work
-    let preCheck;
-    try {
-      preCheck = await Promise.race([
-        chrome.runtime.sendMessage({ type: 'GET_API_KEY' }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))
-      ]);
-    } catch(e) {
-      setStatus('⚙️ Open Settings to configure Clear Home');
-      runBtn.disabled = false;
-      chrome.runtime.sendMessage({ type: 'OPEN_SETTINGS' });
-      return;
-    }
-    if (!preCheck?.apiKey) {
-      setStatus('🔑 API key required — opening Settings…');
-      runBtn.disabled = false;
-      chrome.runtime.sendMessage({ type: 'OPEN_SETTINGS' });
-      return;
-    }
-    const apiKey = preCheck.apiKey;
-
-    // Reset guards so manual button always runs regardless of prior auto-analysis
-    analysisInProgress = false;
-    lastAnalyzedUrl = '';
-    analysisAbortKey++;
-
-    // Start a lightweight first scrape immediately. Its only job is to give the
-    // background worker enough identifiers to prefetch public-record lookups while
-    // the full page capture continues. The final post-expansion scrape below is
-    // still the sole source of truth for the analysis.
-    const earlyScrapePromise = scrapeListing().catch(() => null);
-    earlyScrapePromise.then((earlyData) => {
-      if (!earlyData) return;
-      chrome.runtime.sendMessage({ type: 'PREFETCH_ANALYSIS_LOOKUPS', data: earlyData }).catch(() => {});
-    });
-
-    // Step 1: scroll + expand (kept thorough to preserve capture quality)
-    setStatus('Expanding page contents…');
-    await expandPriceHistory();
-    setStatus('Key OK — scraping…');
-
-    // Step 3: scrape
-    let freshData;
-    try {
-      freshData = await scrapeListing();
-      setStatus('Scraped — building analysis…');
-    } catch(e) {
-      setStatus('❌ Scrape error: ' + e.message);
-      runBtn.disabled = false;
-      return;
-    }
-
-    // Step 4: analyze — pass pre-verified key to skip re-fetch
-    await runAnalysis(freshData, apiKey);
-    runBtn.disabled = false;
+  sendToPanel({
+    type: 'CH_LISTING',
+    listing: {
+      address:     q.address?.split(',')[0] || 'Detecting address…',
+      priceText:   raw > 0 ? label + '$' + Number(raw).toLocaleString() + (mode === 'rent' ? '/mo' : '') : '',
+      listingMode: mode,
+      isOffMarket: q.isOffMarket,
+      note:        mode === 'sold' ? 'Sale history and current value'
+                 : mode === 'rent' ? 'Rental and landlord intel'
+                 : 'Price, offer, taxes and risks',
+      zpid:        chZpid(),
+    },
   });
 }
 
-// ── Canvas spinner — JS-driven, never breaks on innerHTML swap ───────────────
+async function runManualAnalysis() {
+  if (!isListingPage()) { sendToPanel({ type: 'CH_NO_LISTING' }); return; }
+  const setStatus = (t) => sendToPanel({ type: 'CH_STATUS', text: t });
+
+  setStatus('Checking your settings…');
+
+  let preCheck;
+  try {
+    preCheck = await Promise.race([
+      chrome.runtime.sendMessage({ type: 'GET_API_KEY' }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))
+    ]);
+  } catch (e) {
+    sendToPanel({ type: 'CH_NEEDS_KEY' });
+    return;
+  }
+  if (!preCheck?.apiKey) { sendToPanel({ type: 'CH_NEEDS_KEY' }); return; }
+  const apiKey = preCheck.apiKey;
+
+  analysisInProgress = false;
+  lastAnalyzedUrl = '';
+  analysisAbortKey++;
+
+  const earlyScrapePromise = scrapeListing().catch(() => null);
+  earlyScrapePromise.then((earlyData) => {
+    if (!earlyData) return;
+    chrome.runtime.sendMessage({ type: 'PREFETCH_ANALYSIS_LOOKUPS', data: earlyData }).catch(() => {});
+  });
+
+  setStatus('Opening up the full listing…');
+  await expandPriceHistory();
+
+  let freshData;
+  try {
+    setStatus('Reading the listing…');
+    freshData = await scrapeListing();
+  } catch (e) {
+    sendToPanel({ type: 'CH_FAILED', text: 'Could not read this listing: ' + e.message });
+    return;
+  }
+
+  await runAnalysis(freshData, apiKey);
+}
+
 let _spinnerRAF = null;
 function startCanvasSpinner(shadow) {
+  return;
+}
+function startCanvasSpinnerUnused(shadow) {
   if (_spinnerRAF) { cancelAnimationFrame(_spinnerRAF); _spinnerRAF = null; }
   const canvas = shadow.querySelector('#ch-spin-canvas');
   if (!canvas) return;
@@ -3647,7 +3028,6 @@ function startCanvasSpinner(shadow) {
   const style = getComputedStyle(shadow.querySelector('#ch-panel') || document.body);
   const ringColor = style.getPropertyValue('--spinner-ring').trim() || '#e0ddf8';
   const tipColor  = style.getPropertyValue('--spinner-tip').trim()  || '#4F6BFF';
-  // Time-based: one full rotation every 1500ms — independent of monitor refresh rate
   const PERIOD_MS = 900;
   let startTime = null;
   function draw(timestamp) {
@@ -3674,8 +3054,6 @@ function stopCanvasSpinner() {
   if (_spinnerRAF) { cancelAnimationFrame(_spinnerRAF); _spinnerRAF = null; }
 }
 
-// ── Activity feed — zero cost, pure JS timing ─────────────────────────────────
-// Activity step labels per mode — timing is computed dynamically at runtime
 const ACTIVITY_STEPS_BUY = [
   'Scraping listing details…',
   'Fetching tax records…',
@@ -3703,66 +3081,33 @@ function getActivitySteps(mode) {
   return ACTIVITY_STEPS_BUY;
 }
 let _activityTimers = [];
-let _activityShadow = null; // kept so expandPriceHistory can push live messages
 
 function pushActivity(text) {
-  if (!_activityShadow) return;
-  const list = _activityShadow.querySelector('#ch-activity-list');
-  if (!list) return;
-  const item = document.createElement('div');
-  item.className = 'ch-activity-item ch-activity-item--new';
-  item.textContent = text;
-  list.appendChild(item);
-  list.scrollTop = list.scrollHeight;
-  requestAnimationFrame(() => item.classList.remove('ch-activity-item--new'));
+  sendToPanel({ type: 'CH_PROGRESS', text });
 }
 
-// startActivityFeed: called when the API call goes out so we can time against
-// the actual network round-trip. Spreads steps evenly over targetMs (default 45s),
-// holding back the last step until ~2s before expected finish.
 function startActivityFeed(shadow, mode = 'buy', targetMs = 45000) {
-  _activityShadow = shadow;
   _activityTimers.forEach(clearTimeout);
   _activityTimers = [];
-  const list = shadow.querySelector('#ch-activity-list');
-  if (!list) return;
-  list.innerHTML = '';
   const steps = getActivitySteps(mode);
   const n = steps.length;
-  // Space n steps evenly but hold the last one until targetMs - 2000
-  // So: steps 0..n-2 spread over 0 to (targetMs - 2000), last step at targetMs - 2000
   const earlyWindow = Math.max(targetMs - 2000, (n - 1) * 1500);
   const interval = n > 1 ? earlyWindow / (n - 1) : 0;
-  let cumulative = 0;
   steps.forEach((text, i) => {
-    // Add ±20% jitter per step so steps don't feel robotic
     const base = Math.round(i * interval);
     const jitter = i === 0 ? 0 : Math.round((Math.random() - 0.5) * interval * 0.4);
-    const delay = Math.max(i * 800, base + jitter); // never faster than 800ms apart
-    cumulative = delay;
-    const t = setTimeout(() => {
-      if (!shadow.querySelector('#ch-activity-list')) return;
-      const item = document.createElement('div');
-      item.className = 'ch-activity-item ch-activity-item--new';
-      item.textContent = text;
-      list.appendChild(item);
-      list.scrollTop = list.scrollHeight;
-      requestAnimationFrame(() => item.classList.remove('ch-activity-item--new'));
-    }, delay);
-    _activityTimers.push(t);
+    const delay = Math.max(i * 800, base + jitter); 
+    _activityTimers.push(setTimeout(() => pushActivity(text), delay));
   });
 }
 
 function stopActivityFeed(shadow) {
   _activityTimers.forEach(clearTimeout);
   _activityTimers = [];
-  const feed = shadow?.querySelector('#ch-activity');
-  if (feed) feed.style.display = 'none';
 }
 
 async function runAnalysis(preScrapedData, preVerifiedKey) {
   if (!isListingPage() || !clearHomeEnabled) return;
-  // Allow re-analysis if key is pre-verified (manual button) — only block auto-triggers
   if (!preVerifiedKey && analysisInProgress) return;
   if (!preVerifiedKey && location.href === lastAnalyzedUrl) return;
 
@@ -3771,10 +3116,8 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
   lastAnalyzedUrl    = location.href;
   const myAbortKey   = analysisAbortKey;
 
-  // preScrapedData has listingMode from click-time scrape — use it immediately
   const mode = preScrapedData?.listingMode || 'buy';
 
-  // Use pre-verified key if provided (manual button), otherwise fetch
   let apiKey = preVerifiedKey || '';
   let profileRes = {};
   let aiModel = 'claude-sonnet-5';
@@ -3790,7 +3133,7 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
     aiProvider = keyRes?.provider === 'openai' ? 'openai' : 'anthropic';
     profileRes = pRes;
     aiModel = prefsRes?.ch_prefs?.aiModel || (aiProvider === 'openai' ? 'gpt-5.6-terra' : 'claude-sonnet-5');
-    if (aiModel === 'claude-sonnet-4-6') aiModel = 'claude-sonnet-5';   // migrate old default
+    if (aiModel === 'claude-sonnet-4-6') aiModel = 'claude-sonnet-5';   
     if (aiProvider === 'openai' && !aiModel.startsWith('gpt-')) aiModel = 'gpt-5.6-terra';
     if (aiProvider === 'anthropic' && !aiModel.startsWith('claude-')) aiModel = 'claude-sonnet-5';
     chAnalysisEffort = prefsRes?.ch_prefs?.analysisEffort || 'low';
@@ -3803,7 +3146,7 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
     profileRes = pRes;
     aiProvider = prefsRes?.ch_prefs?.aiProvider === 'openai' ? 'openai' : 'anthropic';
     aiModel = prefsRes?.ch_prefs?.aiModel || (aiProvider === 'openai' ? 'gpt-5.6-terra' : 'claude-sonnet-5');
-    if (aiModel === 'claude-sonnet-4-6') aiModel = 'claude-sonnet-5';   // migrate old default
+    if (aiModel === 'claude-sonnet-4-6') aiModel = 'claude-sonnet-5';   
     if (aiProvider === 'openai' && !aiModel.startsWith('gpt-')) aiModel = 'gpt-5.6-terra';
     if (aiProvider === 'anthropic' && !aiModel.startsWith('claude-')) aiModel = 'claude-sonnet-5';
     chAnalysisEffort = prefsRes?.ch_prefs?.analysisEffort || 'low';
@@ -3815,14 +3158,9 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
   const listingData = preScrapedData || await scrapeListing();
   listingData.userProfile = profileRes?.profile || {};
 
-  // Always recreate panel on manual run (preVerifiedKey set) to get fresh DOM
-  // On auto-trigger, only create if not already present
-  if (preVerifiedKey || !panelHost) createPanel(listingData, apiKey);
-
-  // Start spinner and activity feed AFTER createPanel so shadow ref is live
-  const shadow = panelHost?.shadowRoot;
-  startCanvasSpinner(shadow);
-  _activityShadow = shadow; // register shadow early so pushActivity from scroll works
+  createPanel(listingData, apiKey);
+  const shadow = chPanelRoot;
+  sendToPanel({ type: 'CH_ANALYZING', mode });
 
   chrome.runtime.sendMessage({ type: 'LOG_EVENT', event: 'listing_viewed', payload: { site: listingData.listingSite, price: listingData.price } });
 
@@ -3834,16 +3172,10 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
     return;
   }
 
-  // ── Direct API fetch from content script (no service worker lifetime risk) ──
-  // Step 1: SW builds the prompt (fast, no network)
-  // Step 2: content.js calls Anthropic API directly (stays alive in page context)
-  // Step 3: SW parses + post-processes the raw response
   startActivityFeed(shadow, mode, 45000);
 
   let res;
   try {
-    // Step 1: build prompt (with a hard timeout so a dead/evicted service worker
-    // can never leave the analysis spinning forever — this was a perpetual-spinner cause)
     const sendWithTimeout = (message, label, ms) => new Promise((resolve, reject) => {
       let settled = false;
       const to = setTimeout(() => {
@@ -3870,10 +3202,6 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
 
     const promptResult = await sendWithTimeout({ type: 'BUILD_PROMPT', data: listingData, apiKey }, 'Prompt build', 30000);
 
-    // Step 2: call the selected provider directly from the content script.
-    // Retries transient failures (429 rate-limit, 5xx, network/timeout) with backoff.
-    // Stream the same structured response so the user sees real progress and the
-    // request remains protected by one end-to-end timeout (headers through final token).
     const REQUEST_TIMEOUT_MS = (aiModel.includes('opus') || aiModel.includes('sol')) ? 150000 : 120000;
     const readProviderStream = async (resp, isOpenAI) => {
       if (!resp.body?.getReader) throw new Error('Streaming response body is unavailable');
@@ -3938,7 +3266,6 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
       const MAX_ATTEMPTS = 3;
       let lastErr = null;
       const isOpenAI = aiProvider === 'openai';
-      // Build the request body once so a deprecated-param 400 can strip and retry.
       const reqBody = isOpenAI ? {
         model: (window.__chLastModelUsed = aiModel),
         reasoning_effort: (chAnalysisEffort || 'low'),
@@ -3952,13 +3279,7 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
         ]
       } : {
         model: (window.__chLastModelUsed = aiModel),
-        // Sampling params (temperature/top_p/top_k) return a 400 on all
-        // new-generation models (Sonnet 5+, Opus 4.7+, Fable, Mythos). Send
-        // temperature ONLY to the known-old models that still accept it —
-        // an allowlist, so a future model never re-triggers the bug.
         ...(/opus-4-6|opus-4-5|opus-4-1|opus-4-0|sonnet-4-6|sonnet-4-5|sonnet-4-0|sonnet-3|haiku-4|haiku-3|claude-3|claude-2/.test(aiModel) ? { temperature: 0 } : {}),
-        // Sonnet 5 defaults effort to HIGH; low effort is faster/cheaper and
-        // sufficient for this structured extraction task (user-configurable).
         ...(/sonnet-5|opus-4-7|opus-4-8|fable|mythos/.test(aiModel) ? { effort: (chAnalysisEffort || 'low') } : {}),
         max_tokens: mode === 'buy'
           ? (aiModel.includes('opus') ? 8000 : (aiModel.includes('sonnet-5') ? 14000 : 6000))
@@ -3992,13 +3313,11 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
           }
           clearTimeout(timer);
 
-          // Retry on rate-limit / server errors; fail fast on 4xx (bad key, bad request)
           if (resp.status === 429 || resp.status >= 500) {
             const errBody = await resp.json().catch(() => ({}));
             lastErr = new Error(errBody?.error?.message || `API error ${resp.status}`);
             chLog('api_retry', { attempt, status: resp.status });
             if (attempt < MAX_ATTEMPTS) {
-              // Honor Retry-After if present, else exponential backoff (1.5s, 3s)
               const ra = parseFloat(resp.headers.get('retry-after'));
               const waitMs = (ra && ra > 0) ? ra * 1000 : 1500 * attempt;
               await new Promise(r => setTimeout(r, waitMs));
@@ -4007,18 +3326,13 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
             throw lastErr;
           }
 
-          // Non-retryable HTTP error
           const errBody = await resp.json().catch(() => ({}));
           const msg = errBody?.error?.message || `API error ${resp.status}`;
-          // Fast mode is an acceleration tier, not a different model. If this
-          // account/model is ineligible, retry immediately on standard service.
           if (resp.status === 400 && reqBody.service_tier && /service.?tier|fast|priority/i.test(msg)) {
             delete reqBody.service_tier;
             chLog('api_fast_mode_fallback', { msg: msg.slice(0, 120) });
             continue;
           }
-          // Safety net: if a sampling param slips through to a model that rejects
-          // it, strip temperature/top_p/top_k and effort, then retry once.
           if (resp.status === 400 && /temperature|top_p|top_k|sampling|deprecated|effort|response_format|max_completion_tokens/i.test(msg)
               && (reqBody.temperature !== undefined || reqBody.top_p !== undefined || reqBody.top_k !== undefined || reqBody.effort !== undefined || reqBody.reasoning_effort !== undefined || reqBody.response_format !== undefined)
               && !reqBody.__stripped) {
@@ -4041,7 +3355,6 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
           const isNetwork = isAbort || /network|failed to fetch|load failed/i.test(e?.message || '');
           lastErr = isAbort ? new Error(`Request timed out after ${Math.round(REQUEST_TIMEOUT_MS/1000)}s`) : e;
           chLog('api_attempt_failed', { attempt, error: String(lastErr.message).slice(0, 200), network: isNetwork });
-          // Retry network/timeout errors; otherwise rethrow immediately
           if (isNetwork && attempt < MAX_ATTEMPTS) {
             await new Promise(r => setTimeout(r, 1500 * attempt));
             continue;
@@ -4055,7 +3368,6 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
     const { rawText, truncated, apiData } = await callAIProvider();
     chLastRawResponse = rawText || `(no streamed text found)\n${JSON.stringify(apiData).slice(0, 4000)}`;
 
-    // Step 3: finalize (parse + inject pre-computed fields) — also timeout-guarded
     const finalResult = await sendWithTimeout({
       type: 'FINALIZE_RESULT',
       rawText,
@@ -4073,7 +3385,7 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
   analysisInProgress = false;
   stopCanvasSpinner();
   if (analysisAbortKey !== myAbortKey) return;
-  const currentShadow = panelHost?.shadowRoot;
+  const currentShadow = chPanelRoot;
   stopActivityFeed(currentShadow);
   currentShadow?.querySelector('#ch-analyzing-badge')?.style &&
     (currentShadow.querySelector('#ch-analyzing-badge').style.display = 'none');
@@ -4089,7 +3401,6 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
       }
     }
     populatePanel(res.data, listingData);
-    // Show which model was used in footer
     const footerBrand = currentShadow?.querySelector('.ch-footer-brand');
     if (footerBrand) {
       const modelLabel = aiModel.includes('gpt-5.6-terra') ? 'GPT-5.6 Terra'
@@ -4103,172 +3414,25 @@ async function runAnalysis(preScrapedData, preVerifiedKey) {
     }
     chrome.runtime.sendMessage({ type: 'LOG_EVENT', event: 'analysis_generated',
       payload: { status: res.data.valuation?.status || res.data.listingMode } });
+    pushPanel();
   } else {
     showErrorState(res?.error || 'Unknown error');
   }
 }
 
-// ── Panel creation ────────────────────────────────────────────────────────────
 function createPanel(listingData, apiKey) {
-  if (panelHost) panelHost.remove();
-
-  panelHost = document.createElement('div');
-  panelHost.id = 'clear-home-host';
-  document.body.appendChild(panelHost);
-
-  const shadow = panelHost.attachShadow({ mode: 'open' });
-
-  const fontLink = document.createElement('link');
-  fontLink.rel = 'stylesheet';
-  fontLink.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap';
-  shadow.appendChild(fontLink);
-
-  const style = document.createElement('style');
-  style.textContent = getPanelStyles();
-  shadow.appendChild(style);
-
-  const panelEl = document.createElement('div');
-  panelEl.id = 'ch-panel';
-  panelEl.innerHTML = getPanelHTML(listingData);
-  shadow.appendChild(panelEl);
-
-  homePanel = panelEl;
+  chPanelRoot = document.createElement('div');
+  chPanelRoot.id = 'ch-panel';
+  chPanelRoot.innerHTML = getPanelHTML(listingData);
+  homePanel = chPanelRoot;
+  chRateLabCtx = null;
   applyTheme(currentTheme);
-  requestAnimationFrame(() => requestAnimationFrame(() => panelEl.classList.add('visible')));
-  wirePanelEvents(shadow, panelEl);
-}
-
-function wirePanelEvents(shadow, panelEl) {
-  // ── Download Logs (delegated) ───────────────────────────────────────────────
-  // Wired once at panel creation via event delegation on the shadow root, so it
-  // works no matter when the button renders or whether populatePanel completed.
-  // Covers buy/sold/rent button IDs.
-  shadow.addEventListener('click', (e) => {
-    const btn = e.target?.closest?.(
-      '#ch-downloadlogs-btn, #ch-sold-downloadlogs-btn, #ch-rent-downloadlogs-btn'
-    );
-    if (!btn) return;
-    // If a direct handler is already bound to this button, let it handle the click.
-    if (btn.dataset.chWired) return;
-    e.preventDefault();
-    try {
-      downloadDiagnosticLogs(chLastScraped || {});
-    } catch (err) {
-      try { console.error('[Clear Home] Download Logs failed:', err); } catch (e2) {}
-      alert('Clear Home: log export failed — ' + (err?.message || err));
-    }
-  });
-
-  // ── Drag to reposition ─────────────────────────────────────────────────────
-  // Lets users drag the panel by its header to any position on screen.
-  // Works on the host element (outside shadow DOM) since that's what has position.
-  const header = shadow.querySelector('.ch-header');
-  if (header && panelHost) {
-    let isDragging = false;
-    let startX, startY, startLeft, startTop;
-
-    header.addEventListener('mousedown', (e) => {
-      // Don't drag when clicking buttons
-      if (e.target.closest('button')) return;
-      isDragging = true;
-      startX = e.clientX;
-      startY = e.clientY;
-      const rect = panelHost.getBoundingClientRect();
-      startLeft = rect.left;
-      startTop  = rect.top;
-      // Switch from right/bottom anchoring to left/top for free positioning
-      panelHost.style.right  = 'auto';
-      panelHost.style.bottom = 'auto';
-      panelHost.style.left   = startLeft + 'px';
-      panelHost.style.top    = startTop  + 'px';
-      e.preventDefault();
-    });
-
-    document.addEventListener('mousemove', (e) => {
-      if (!isDragging) return;
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      const newLeft = Math.max(0, Math.min(window.innerWidth  - panelHost.offsetWidth,  startLeft + dx));
-      const newTop  = Math.max(0, Math.min(window.innerHeight - panelHost.offsetHeight, startTop  + dy));
-      panelHost.style.left = newLeft + 'px';
-      panelHost.style.top  = newTop  + 'px';
-    });
-
-    document.addEventListener('mouseup', () => { isDragging = false; });
-  }
-
-  shadow.querySelector('#ch-close')?.addEventListener('click', () => {
-    panelEl.classList.remove('visible');
-    // Keep panel in DOM — icon click restores it without re-running analysis
-    chrome.runtime.sendMessage({ type: 'LOG_EVENT', event: 'panel_closed' });
-  });
-
-  // Settings gear — open settings in new tab
-  shadow.querySelector('#ch-settings-btn')?.addEventListener('click', () => {
-    chrome.runtime.sendMessage({ type: 'OPEN_SETTINGS' });
-  });
-
-  const fsboToggle = shadow.querySelector('#ch-fsbo-toggle');
-  if (fsboToggle) {
-    fsboToggle.addEventListener('click', () => {
-      const sec = shadow.querySelector('#ch-fsbo-section');
-      sec?.classList.toggle('collapsed');
-      fsboToggle.textContent = sec?.classList.contains('collapsed') ? '▸' : '▾';
-    });
-  }
-
-  shadow.querySelectorAll('[data-section-toggle]').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const target = shadow.querySelector(btn.dataset.sectionToggle);
-      const isCollapsed = target?.classList.toggle('collapsed');
-      btn.textContent = isCollapsed ? '▸' : '▾';
-      const sectionName = btn.dataset.sectionToggle.replace('#ch-', '').replace('-body', '');
-      chrome.runtime.sendMessage({ type: 'LOG_EVENT', event: 'section_expanded', payload: { section: sectionName } });
-    });
-  });
-}
-
-function getManualTriggerHTML(listingData) {
-  const { address, price, listingSite, isFSBO } = listingData;
-  const mode         = listingData.listingMode || 'buy';
-  const shortAddr    = address?.split(',')[0] || 'This listing';
-  // For rent: use rentPrice (locked from quick scrape) or price if valid monthly amount
-  const rentAmt      = listingData.rentPrice || 0;
-  const rawPrice     = (mode === 'rent')
-    ? (rentAmt > 0 ? rentAmt : (price > 0 && price <= 50000 ? price : 0))
-    : (listingData.soldPrice || price || 0);
-  const priceLabel   = mode === 'sold' ? (listingData.isOffMarket ? 'Last Sold ' : 'Sold ') : mode === 'rent' ? 'Rent ' : '';
-  const displayPrice = rawPrice > 0 ? priceLabel + '$' + Number(rawPrice).toLocaleString() + (mode === 'rent' ? '/mo' : '') : '';
-
-  return `
-    <div class="ch-header">
-      <div class="ch-logo">
-        ${SVG_LOGO}
-        <span class="ch-title">Clear Home</span>
-      </div>
-      <button id="ch-settings-btn" class="ch-gear" title="Settings" aria-label="Settings"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M7 1v1.5M7 11.5V13M1 7h1.5M11.5 7H13M2.93 2.93l1.06 1.06M10.01 10.01l1.06 1.06M2.93 11.07l1.06-1.06M10.01 3.99l1.06-1.06" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
-        <button id="ch-close" class="ch-close" title="Close">✕</button>
-    </div>
-    <div class="ch-trigger-body">
-      <div class="ch-trigger-addr">${shortAddr}${displayPrice ? ' · ' + displayPrice : ''}${listingData.isOffMarket ? ' <span style="font-size:9px;opacity:0.6;">(off market)</span>' : ''}</div>
-      <button id="ch-run-analysis" class="ch-run-btn">
-        <svg width="14" height="14" viewBox="0 0 14 14" fill="none" style="margin-right:6px;flex-shrink:0;">
-          <circle cx="7" cy="7" r="6.5" stroke="currentColor" stroke-opacity="0.4"/>
-          <polygon points="5.5,4.5 10,7 5.5,9.5" fill="currentColor"/>
-        </svg>
-        Analyze Listing
-      </button>
-      <div class="ch-trigger-note">${ mode === 'sold' ? 'Sale history & current value' : mode === 'rent' ? 'Rental & landlord intel' : 'Price, offer, taxes & risks' }</div>
-    </div>
-  `;
 }
 
 function getPanelHTML(listingData) {
   const { address, price, listingSite, isFSBO } = listingData;
   const mode      = listingData.listingMode || 'buy';
   const shortAddr = address?.split(',')[0] || 'Loading…';
-  // Price display — for sold show sold price, for rent show monthly rent
-  // For rent: use rentPrice (locked from quick scrape) or price if valid monthly amount
   const rentAmt2     = listingData.rentPrice || 0;
   const rawPrice     = (mode === 'rent')
     ? (rentAmt2 > 0 ? rentAmt2 : (price > 0 && price <= 50000 ? price : 0))
@@ -4278,15 +3442,6 @@ function getPanelHTML(listingData) {
   const displayPrice = rawPrice > 0 ? priceLabel + Number(rawPrice).toLocaleString() + priceSuffix : '';
 
   return `
-    <div class="ch-header">
-      <div class="ch-logo">
-        ${SVG_LOGO}
-        <span class="ch-title">Clear Home</span>
-      </div>
-      <button id="ch-settings-btn" class="ch-gear" title="Settings" aria-label="Settings"><svg width="14" height="14" viewBox="0 0 14 14" fill="none"><circle cx="7" cy="7" r="2" stroke="currentColor" stroke-width="1.3"/><path d="M7 1v1.5M7 11.5V13M1 7h1.5M11.5 7H13M2.93 2.93l1.06 1.06M10.01 10.01l1.06 1.06M2.93 11.07l1.06-1.06M10.01 3.99l1.06-1.06" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg></button>
-        <button id="ch-close" class="ch-close" title="Close">✕</button>
-    </div>
-
     <div class="ch-property-bar">
       <div class="ch-prop-address">${shortAddr}</div>
       <div class="ch-prop-meta">
@@ -4497,8 +3652,6 @@ function getPanelHTML(listingData) {
   `;
 }
 
-// ── Panel population ──────────────────────────────────────────────────────────
-// Helper: set status badge on a section header (always visible, even collapsed)
 function setBadge(shadow, id, text, variant) {
   const el = shadow.querySelector(id);
   if (!el || !text) return;
@@ -4508,14 +3661,11 @@ function setBadge(shadow, id, text, variant) {
 }
 
 function populatePanel(result, listingData) {
-  const shadow = panelHost?.shadowRoot;
+  const shadow = chPanelRoot;
   if (!shadow) return;
 
-  // Capture for diagnostics / Download Logs
   chLastResult = result;
   chLastScraped = listingData;
-  // Fold any background-side diagnostics (clamp events, tax basis, parse recovery)
-  // into the rolling event log so they appear in Download Logs (C2).
   try {
     if (result?._diag) {
       if (result._diag.fairValueClampFired) {
@@ -4546,12 +3696,9 @@ function populatePanel(result, listingData) {
   const mode = listingData.listingMode || 'buy';
   shadow.querySelector('#ch-results').style.display = 'block';
 
-  // Route to mode-specific population
   if (mode === 'sold') { populateSoldPanel(result, listingData, shadow); return; }
   if (mode === 'rent') { populateRentPanel(result, listingData, shadow); return; }
-  // else fall through to buy panel below
 
-  // ── Section badges ─────────────────────────────────────────────────────────
   const val = result.valuation;
   const tax = result.taxEstimate;
   const afford = result.affordability;
@@ -4561,15 +3708,12 @@ function populatePanel(result, listingData) {
   const ca  = result.comparableAnalysis;
   const opp = result.buyerOpportunity;
 
-  // Price Reality Check badge — show $/sqft market position instead of valuation status (avoids redundancy)
   const ppsqVerdict = result.pricePerSqft?.verdict || '';
   const priceVariant = { 'Below Market': 'under', 'At Market': 'fair', 'Above Market': 'over', 'Well Overpriced': 'over' }[ppsqVerdict]
     || { 'Overpriced': 'over', 'Well Overpriced': 'over', 'Underpriced': 'under', 'Fair Value': 'fair' }[val?.status] || 'neutral';
   setBadge(shadow, '#ch-badge-price', ppsqVerdict || val?.status || '', priceVariant);
 
-  // Tax Reset badge
   if (tax) {
-    // The badge and displayed estimate must use the same offer-price basis.
     const offerBasis = result.buyerOpportunity?.suggestedOffer || listingData.price || 0;
     const rateBasis = tax.rateUsed > 0 ? tax.rateUsed : 0.0165;
     const exemptionBasis = tax.exemptionTotal || 0;
@@ -4583,37 +3727,30 @@ function populatePanel(result, listingData) {
     }
     if (tax.taxWillIncrease)   setBadge(shadow, '#ch-badge-tax', 'Tax Increase Expected', 'warn');
     else if (tax.taxWillStayFlat) setBadge(shadow, '#ch-badge-tax', 'Taxes Stay Flat', 'ok');
-    // (no badge when neither applies — "Est. Available" was noise)
   }
 
-  // Price History badge — highlight if prior listing failure
   const hadPriorListing = pha?.flags?.some(f => /fail|did not sell|expired|withdrawn|reduced|relisted/i.test(f));
   if (hadPriorListing)       setBadge(shadow, '#ch-badge-history', 'Prior Listing ↓', 'good');
   else if (pha?.flags?.length) setBadge(shadow, '#ch-badge-history', 'Flags', 'warn');
 
-  // Comps badge
   const compsBadgeMap = { 'Highest': 'over', 'Above Average': 'over', 'Average': 'fair', 'Below Average': 'under', 'Lowest': 'under' };
   if (ca?.pricePosition) setBadge(shadow, '#ch-badge-comps', ca.pricePosition, compsBadgeMap[ca.pricePosition] || 'neutral');
 
-  // Affordability badge
   const affordVariant = { 'Affordable': 'ok', 'Borderline': 'warn', 'Stretched': 'over', 'Unknown': 'neutral' }[afford?.verdict] || 'neutral';
   if (afford?.verdict) setBadge(shadow, '#ch-badge-afford', afford.verdict, affordVariant);
 
-  // Appreciation badge
   if (macro?.excessOverMarket !== null && macro?.excessOverMarket !== undefined) {
     if (macro.excessOverMarket > 5)       setBadge(shadow, '#ch-badge-macro', `+${macro.excessOverMarket}% vs Market`, 'over');
     else if (macro.excessOverMarket < -3) setBadge(shadow, '#ch-badge-macro', 'Below Market', 'under');
     else                                   setBadge(shadow, '#ch-badge-macro', 'At Market', 'fair');
   }
 
-  // Risk Flags badge — show severity level, not redundant "Review Before Offer"
   const highRisks  = (result.risks || []).filter(r => r.severity === 'high').length;
   const medRisks   = (result.risks || []).filter(r => r.severity === 'medium').length;
   if (highRisks > 0)      setBadge(shadow, '#ch-badge-risks', `${highRisks} High`, 'over');
   else if (medRisks > 0)  setBadge(shadow, '#ch-badge-risks', `${medRisks} Medium`, 'warn');
   else if ((result.risks || []).length > 0) setBadge(shadow, '#ch-badge-risks', 'Low Risk', 'ok');
 
-  // Agent badge — FSBO gets its own badge, otherwise show concerns status
   if (listingData.isFSBO) {
     setBadge(shadow, '#ch-badge-agent', 'FSBO', 'warn');
   } else if (agv?.licenseStatus) {
@@ -4628,13 +3765,11 @@ function populatePanel(result, listingData) {
     }
   }
 
-  // ── TLDR — reveal after analysis ──────────────────────────────────────────
   const tldrEl   = shadow.querySelector('#ch-tldr-text');
   const tldrWrap = shadow.querySelector('#ch-tldr');
   const analyzingBadge = shadow.querySelector('#ch-analyzing-badge');
   if (analyzingBadge) analyzingBadge.style.display = 'none';
 
-  // Update price — use scraper result, then fall back to valuation midpoint
   const priceEl = shadow.querySelector('#ch-prop-price-val');
   if (priceEl && (!priceEl.textContent || priceEl.textContent.trim() === '')) {
     const bestPrice = listingData.price ||
@@ -4650,24 +3785,19 @@ function populatePanel(result, listingData) {
       if (val?.status === 'Overpriced' || val?.status === 'Well Overpriced') tldrWrap.classList.add('ch-tldr--over');
       else if (val?.status === 'Underpriced')  tldrWrap.classList.add('ch-tldr--under');
       else                                     tldrWrap.classList.add('ch-tldr--fair');
-      // note: sold/rent panels use their own TLDR setup
     }
   }
 
-  // ── Key Highlights section — compact prop meta strip + analysis bullets ─────
   const highlightsSect = shadow.querySelector('#ch-highlights-section');
   const propMetaEl     = shadow.querySelector('#ch-prop-meta-strip');
   const highlightsEl   = shadow.querySelector('#ch-highlights-content');
 
-  // Always show highlights section after analysis
   if (highlightsSect) highlightsSect.style.display = '';
 
-  // ── Build consolidated compact meta strip (stats + builder) for Key Highlights ──
   if (propMetaEl) {
     const sqft    = listingData.sqft    || listingData.livingArea || 0;
     const beds    = listingData.beds    || listingData.bedrooms   || 0;
     let baths     = listingData.baths   || listingData.bathrooms  || 0;
-    // Hard display-time guard for bath concatenation artifacts.
     if (baths > 10) {
       const str = String(baths);
       if (/^(\d)(\d)$/.test(str)) {
@@ -4679,7 +3809,6 @@ function populatePanel(result, listingData) {
       } else baths = 0;
     }
 
-    // Lot parsing
     const lotRaw  = listingData.lotSize || listingData.lotSqft || '';
     let lotDisplay = '';
     let lotSqftNum = 0;
@@ -4697,7 +3826,6 @@ function populatePanel(result, listingData) {
     const price   = listingData.price   || 0;
     const ppsqft  = sqft > 0 && price > 0 ? Math.round(price / sqft) : 0;
 
-    // Row 1: core stats
     const coreStats = [
       beds    ? `<span class="ch-meta-chip"><strong>${beds}</strong> bd</span>` : '',
       baths   ? `<span class="ch-meta-chip"><strong>${baths}</strong> ba</span>` : '',
@@ -4705,13 +3833,11 @@ function populatePanel(result, listingData) {
       ppsqft  ? `<span class="ch-meta-chip"><strong>$${ppsqft}</strong>/sqft</span>` : '',
     ].filter(Boolean);
 
-    // Row 1b: lot and HOA on their own line when present (prevents awkward wrapping)
     const lotHoaParts = [
       showLot ? `<span class="ch-meta-chip"><strong>${lotDisplay}</strong> lot</span>` : '',
       hoa     ? `<span class="ch-meta-chip"><strong>$${Number(hoa).toLocaleString()}</strong>/mo HOA</span>` : '',
     ].filter(Boolean);
 
-    // Row 2: builder/model/year
     const builderParts = [
       listingData.builderName   ? `<span class="ch-meta-chip"><span class="ch-meta-lbl">Builder:</span> ${listingData.builderName}</span>`  : '',
       listingData.propertyModel ? `<span class="ch-meta-chip"><span class="ch-meta-lbl">Model:</span> ${listingData.propertyModel}</span>`   : '',
@@ -4726,7 +3852,6 @@ function populatePanel(result, listingData) {
     if (metaHtml) propMetaEl.style.display = '';
   }
 
-  // Key highlights bullets from Claude's analysis
   const highlights = result.keyHighlights || [];
   if (highlightsEl && highlights.length > 0) {
     highlightsEl.innerHTML = `<ul class="ch-highlights-list">${
@@ -4734,11 +3859,9 @@ function populatePanel(result, listingData) {
     }</ul>`;
   }
 
-  // ── Property info bar — now hidden; data is in Key Highlights compact strip ──
   const propInfoBar = shadow.querySelector('#ch-propinfo-bar');
   if (propInfoBar) propInfoBar.style.display = 'none';
 
-  // ── Commute section ────────────────────────────────────────────────────────
   const commuteResults = result._commuteResults || listingData._commuteResults || {};
   const commuteSect    = shadow.querySelector('#ch-commute-section');
   const commuteEl      = shadow.querySelector('#ch-commute-content');
@@ -4755,7 +3878,6 @@ function populatePanel(result, listingData) {
     }</div>`;
   }
 
-  // ── Valuation content ──────────────────────────────────────────────────────
   const ppsq    = result.pricePerSqft;
   const premium = result.premiumAnalysis;
 
@@ -4772,11 +3894,7 @@ function populatePanel(result, listingData) {
     ${premium?.explanation ? `<div class="ch-rationale" style="border-left-color:var(--accent);margin-top:6px;">🏆 ${premium.explanation}</div>` : (val?.rationale ? `<div class="ch-rationale" style="margin-top:6px;">${val.rationale}</div>` : '')}
   `;
 
-  // Tax Reset Estimate
-  // tax already declared above
   if (tax) {
-    // Recompute the reset at the Clear Home OFFER price (the note says "applied at
-    // the offer price"), so the displayed figures match that basis and the PITI bar.
     const _offer = result.buyerOpportunity?.suggestedOffer || listingData.price || 0;
     const _rate  = (tax.rateUsed > 0) ? tax.rateUsed : 0.0165;
     const _exempt = tax.exemptionTotal || 0;
@@ -4815,7 +3933,6 @@ function populatePanel(result, listingData) {
     if (taxElFallback) taxElFallback.innerHTML = '<div class="ch-empty-state">Tax data not available.</div>';
   }
 
-  // Price & Appreciation — price history events + macro appreciation merged
   const phaEl = shadow.querySelector('#ch-pricehistory-content');
   if (phaEl && pha) {
     const domTrendHtml = pha.domTrend ? (() => {
@@ -4829,7 +3946,6 @@ function populatePanel(result, listingData) {
       ${macro ? `<div class="ch-tax-row ch-tax-row--arrow"><div class="ch-tax-col"><div class="ch-tax-label">FHFA Estimate</div><div class="ch-tax-val">${macro.orlandoMsaExpectedPct != null ? (macro.orlandoMsaExpectedPct > 0 ? '+' : '') + Number(macro.orlandoMsaExpectedPct).toFixed(1) + '%' : '?%'}</div>${macro.orlandoExpectedPrice ? `<div class="ch-tax-sub">→ $${Number(macro.orlandoExpectedPrice).toLocaleString()}</div>` : ''}</div><div class="ch-tax-arrow">vs</div><div class="ch-tax-col"><div class="ch-tax-label">Listed</div><div class="ch-tax-val ${(macro.excessOverMarket ?? 0) > 5 ? 'ch-tax--warning' : ''}">${macro.actualAppreciationPct != null ? (macro.actualAppreciationPct > 0 ? '+' : '') + Number(macro.actualAppreciationPct).toFixed(1) + '%' : '?%'}</div><div class="ch-tax-sub">List: $${Number(listingData.price||0).toLocaleString()}</div></div></div><div class="ch-rationale" style="margin-top:6px;">${(macro.excessOverMarket ?? 0) > 0 ? `<strong style="color:var(--amber);">+${Number(macro.excessOverMarket).toFixed(1)}% above FHFA estimate.</strong> ` : (macro.excessOverMarket ?? 0) < 0 ? `<strong style="color:var(--green);">${Number(macro.excessOverMarket).toFixed(1)}% below FHFA estimate.</strong> ` : ''}${macro.negotiationImplication || macro.interpretation || ''}</div>` : ''}
       ${pha.flags?.length ? `<div style="margin-top:6px;">${pha.flags.map(f => `<div class="ch-risk-explanation" style="color:var(--text-2);margin-bottom:3px;">⚑ ${f}</div>`).join('')}</div>` : ''}
     `;
-    // Update badge for the merged section
     if (macro) {
       const excess = macro.excessOverMarket ?? 0;
       setBadge(shadow, '#ch-badge-history',
@@ -4838,16 +3954,12 @@ function populatePanel(result, listingData) {
     }
   }
 
-  // Macro section removed — content merged into Price & Appreciation above
 
-  // Buyer Strategy section removed — inspection point recycled into What To Do Next.
-  // Extract the inspection bullet from opp.points if it exists
   const inspectionBullet = (opp?.points || []).find(p => /inspect|inspection|HVAC|roof|water heater/i.test(p));
 
-  // Affordability vs Investor Cash Flow — swap based on investment priority
   const isInvestmentPriority = (listingData.userProfile?.priorities || []).includes('investment');
   const affordSection = shadow.querySelector('.ch-section:has(#ch-afford-body)') ||
-    (() => { // fallback: find by label text
+    (() => { 
       return [...shadow.querySelectorAll('.ch-section-label')]
         .find(el => el.textContent.trim() === 'Affordability')?.closest('.ch-section');
     })();
@@ -4855,14 +3967,12 @@ function populatePanel(result, listingData) {
   const affordEl = shadow.querySelector('#ch-afford-content');
 
   if (isInvestmentPriority && result.investorCashFlow) {
-    // Swap the section header to Investor Cash Flow
     const icf = result.investorCashFlow;
     const cfNum = icf.monthlyCashFlow !== null && icf.monthlyCashFlow !== undefined ? Number(icf.monthlyCashFlow) : null;
     const cov   = icf.coverageRatio ? Number(icf.coverageRatio) : null;
     const cfVariant = cfNum === null ? 'neutral' : cfNum < 0 ? 'over' : cov >= 1.25 ? 'ok' : 'fair';
     const cfBadge   = cfNum === null ? 'No Rent Data' : (cfNum >= 0 ? '+$' : '-$') + Math.abs(cfNum).toLocaleString() + '/mo';
 
-    // Update section header
     const iconEl  = affordSection?.querySelector('.ch-section-icon');
     const labelEl = affordSection?.querySelector('.ch-section-label');
     const badgeEl = affordSection?.querySelector('#ch-badge-afford');
@@ -4889,30 +3999,24 @@ function populatePanel(result, listingData) {
       ${icf.investmentNote ? `<div class="ch-rationale" style="margin-top:6px;">${icf.investmentNote}</div>` : ''}
     `;
   } else if (affordEl && afford) {
-    // ── Single-bar disposable income design (based on Clear Home offer) ────
     const takehome   = result._monthlyTakehome || 0;
     const debts      = afford.monthlyDebts || (listingData.userProfile?.monthlyDebts) || 0;
     const discretionary = listingData.userProfile?.monthlyDiscretionary || 0;
 
-    // Utility cost: user-provided if available, else estimate from sqft
     const userUtil   = listingData.userProfile?.monthlyUtilities || 0;
     const sqftNum    = parseFloat((listingData.sqft||'').toString().replace(/[^0-9.]/g,'')) || 0;
     const stories    = listingData.stories || 1;
     const utilRate   = (1.50 + (stories > 1 ? 0.30 : 0)) / 12;
     const utilEst    = userUtil > 0 ? userUtil : (sqftNum > 0 ? Math.round(sqftNum * utilRate) : 0);
 
-    // Insurance: prefer % of price (annual), fall back to flat $/mo
     const insPctAnnual = listingData.userProfile?.insurancePct || 0;
 
-    // PITI calculator reused by bar + sensitivity table
     const calcPITIBreakdown = (price, rateOverride) => {
       const dp   = afford.downPaymentPct || 20;
       const loan = price * (1 - dp/100);
       const r    = (rateOverride || afford.mortgageRatePct || 7) / 100 / 12;
       const n    = 360;
       const pi   = r > 0 ? Math.round(loan * (r * Math.pow(1+r,n)) / (Math.pow(1+r,n)-1)) : Math.round(loan/n);
-      // Tax: use the server-computed effective rate + exemptions, applied at this price.
-      // Falls back to 1.65% only if the rate wasn't provided.
       const taxRate    = (result.taxEstimate?.rateUsed > 0) ? result.taxEstimate.rateUsed : 0.0165;
       const exemption  = result.taxEstimate?.exemptionTotal || 0;
       const taxable    = Math.max(0, price - exemption);
@@ -4923,7 +4027,6 @@ function populatePanel(result, listingData) {
     };
     const calcPITI = (price) => calcPITIBreakdown(price).total;
 
-    // Bar reflects the Clear Home OFFER scenario — the actionable one the user would pay
     const listPrice  = listingData.price || 0;
     const offerPrice = result.buyerOpportunity?.suggestedOffer || listPrice;
     const barPrice   = offerPrice > 0 ? offerPrice : listPrice;
@@ -4936,7 +4039,6 @@ function populatePanel(result, listingData) {
     const remaining  = takehome > 0 ? takehome - totalCost : 0;
     const denominator = takehome > 0 ? takehome : totalCost;
 
-    // Segment percentages (of take-home or total cost if no take-home)
     const seg = (v) => Math.max(Math.round(v / denominator * 100), v > 0 ? 1 : 0);
     const segments = [
       { label: 'P&I',     val: piPay,   pct: seg(piPay),   color: '#5b8def' },
@@ -4961,13 +4063,11 @@ function populatePanel(result, listingData) {
 
     let unaffordMsg = '';
     if (takehome > 0 && isShort) {
-      // Max affordable price = how much house the remaining budget can support
       const availForPITI = takehome - debts - discretionary - utilEst;
       const pitiPerDollar = barPrice > 0 ? calcPITI(barPrice) / barPrice : 0;
       const maxPrice = (availForPITI > 0 && pitiPerDollar > 0)
         ? Math.round(availForPITI / pitiPerDollar / 1000) * 1000
         : 0;
-      // Salary increase estimate: ratio of annual salary to monthly take-home
       const annualSalary = listingData.userProfile?.annualIncome || 0;
       const salaryToTakehomeRatio = (annualSalary > 0 && takehome > 0) ? annualSalary / (takehome * 12) : 0;
       const monthlyShortfall = Math.abs(remaining);
@@ -4980,13 +4080,6 @@ function populatePanel(result, listingData) {
       </div>`;
     }
 
-    // ── Sensitivity analysis: sorted LOW to HIGH by price ────────────────
-    // NOTE: two distinct concepts here, kept clearly labeled:
-    //   - valuation.low/high      → the AI's fair-value RANGE (broader)
-    //   - buyerOpportunity.fairValue → our computed market-bottom anchor (FHFA/comp blend)
-    // The market-bottom can sit below the fair-value range; that's expected — it's the
-    // floor of defensible value, not the midpoint. Labeling them distinctly avoids the
-    // confusing "Fair value < Fair value low" wording.
     const fairHigh = result.valuation?.high || 0;
     const fairLow  = result.valuation?.low  || 0;
     const marketBottom = result.buyerOpportunity?.fairValue || result.buyerOpportunity?.marketBottom || 0;
@@ -5007,13 +4100,11 @@ function populatePanel(result, listingData) {
 
     const rawScenarios = [
       offerPrice > 0 ? { label: 'Clear Home offer', price: offerPrice, color: 'var(--green-text, #1a7a42)' } : null,
-      // Our market-bottom anchor (shown when distinct from the offer)
       marketBottom > 0 && Math.abs(marketBottom - offerPrice) > 1000 ? { label: 'Est. market bottom', price: marketBottom, color: 'var(--accent, #4F6BFF)' } : null,
       fairLow > 0 && fairLow !== offerPrice && fairLow !== marketBottom ? { label: 'Fair value range (low)',  price: fairLow,  color: 'var(--accent, #4F6BFF)' } : null,
       fairHigh > 0 && fairHigh !== listPrice && fairHigh !== offerPrice && fairHigh !== marketBottom ? { label: 'Fair value range (high)', price: fairHigh, color: 'var(--accent, #4F6BFF)' } : null,
       listPrice > 0 ? { label: 'List price', price: listPrice, color: 'var(--amber-text, #b35e0a)' } : null,
     ].filter(Boolean);
-    // Sort by price ascending (low → high)
     const scenarios = rawScenarios.sort((a, b) => a.price - b.price);
 
     let sensitivityHtml = '';
@@ -5072,27 +4163,12 @@ function populatePanel(result, listingData) {
       ${afford.dtiTotalDanger ? `<div class="ch-risk ch-risk--high" style="margin-top:5px;"><div class="ch-risk-explanation">⚠ Total DTI ${afford.dtiTotalPct}% hits lending limits (43% max).</div></div>` : ''}
       ${afford.note ? `<div class="ch-rationale" style="margin-top:5px;"><strong>At the Clear Home offer PITI:</strong> ${afford.note}</div>` : ''}
     `;
-    const rateSlider = affordEl.querySelector('#ch-rate-lab');
-    rateSlider?.addEventListener('input', () => {
-      const rate = Number(rateSlider.value);
-      const livePiti = calcPITIBreakdown(barPrice, rate).total;
-      const liveLeft = takehome - livePiti - utilEst - debts - discretionary;
-      const label = affordEl.querySelector('#ch-rate-lab-label');
-      const piti = affordEl.querySelector('#ch-rate-lab-piti');
-      const left = affordEl.querySelector('#ch-rate-lab-left');
-      if (label) label.textContent = `${rate.toFixed(3)}%`;
-      if (piti) piti.textContent = `$${livePiti.toLocaleString()}/mo`;
-      if (left) {
-        left.textContent = `${liveLeft < 0 ? '-' : '+'}$${Math.abs(liveLeft).toLocaleString()} left`;
-        left.className = liveLeft < 0 ? 'ch-afford-neg' : 'ch-afford-pos';
-      }
-    });
+    chRateLabCtx = { barPrice, takehome, utilEst, debts, discretionary };
   } else if (affordEl) {
     affordEl.innerHTML = '<div class="ch-empty-state">Add your income in settings for DTI analysis.</div>';
   }
 
   const agvEl = shadow.querySelector('#ch-agent-content');
-  // Agent section shows MLS# plus the listing agent's phone (from the "Listed by" line).
   const agentPhone = listingData.agentPhone || agv?.phone || '';
   const agentMlsLine = (listingData.mlsId || agentPhone)
     ? `<span class="ch-meta-lbl">MLS#</span> <strong>${listingData.mlsId || 'N/A'}</strong>${agentPhone ? `<span class="ch-meta-lbl" style="margin-left:12px;">☎</span> <strong>${agentPhone}</strong>` : ''}`
@@ -5106,12 +4182,10 @@ function populatePanel(result, listingData) {
   } else if (agvEl && agv) {
     const renewBadge = agv.renewalStatus && agv.renewalStatus !== 'Current'
       ? `<span class="ch-risk-badge ch-risk-badge--high" style="margin-left:6px;">${agv.renewalStatus}</span>` : '';
-    // License: single mention with employer inline
     const employer = agv.employerOnFile || '';
     const licLine = agv.licenseNumber
       ? ` · <span class="ch-meta-lbl">License</span> ${agv.licenseNumber} (FL DBPR)${agv.expiry ? `, exp ${agv.expiry}` : ''}${employer ? ` · ${employer}` : ''}`
       : '';
-    // Clean recommendation: aggressively strip license duplication, generic phrases, dashes, (SL-)
     const licNum = agv.licenseNumber || '';
     let recText = (agv.recommendation || '')
       .replace(new RegExp(licNum.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '')
@@ -5151,7 +4225,6 @@ function populatePanel(result, listingData) {
     `;
   }
 
-  // Comparable Analysis — per-comp boxes + market position
   const caEl = shadow.querySelector('#ch-comps-content');
   if (caEl) {
     const allComps  = listingData.nearbyHomes || [];
@@ -5159,7 +4232,6 @@ function populatePanel(result, listingData) {
     const subSqft   = parseFloat((listingData.sqft || '').toString().replace(/[^0-9.]/g, '')) || 0;
     const subPpsq   = (subPrice > 0 && subSqft > 0) ? Math.round(subPrice / subSqft) : null;
 
-    // Filter to matching beds/baths — ALWAYS enforce, no fallback to all comps
     const parseBeds  = v => parseInt((v || '0').toString().replace(/[^0-9]/g,'')) || 0;
     const parseBaths = v => parseFloat((v || '0').toString().replace(/[^0-9.]/g,'')) || 0;
     const subBedsN   = parseBeds(listingData.beds || listingData.bedrooms);
@@ -5169,10 +4241,8 @@ function populatePanel(result, listingData) {
       ? allComps.filter(h => parseBeds(h.beds) === subBedsN)
       : allComps;
 
-    // Build per-comp boxes — all scraped comps (carousel may have 8-12)
     const compBoxes = comps.map(h => {
       const pNum = h.priceNum || parseInt((h.price||'').replace(/[^0-9]/g,''), 10) || 0;
-      // Parse sqft: "2.2k sqft" → 2200, "1800 sqft" → 1800
       const sqftStr = (h.sqft||'').toLowerCase().trim();
       const sqftK   = sqftStr.match(/^([\d.]+)k/);
       const sqftPlain = sqftStr.match(/^([\d,]+)\s*sqft/);
@@ -5181,11 +4251,9 @@ function populatePanel(result, listingData) {
                     : 0;
       const ppsq = (pNum > 0 && sqftNum > 0) ? Math.round(pNum / sqftNum) : null;
 
-      // Beds: use stored h.beds string (e.g. "3 bd") not raw card text
       const bedsDisplay = h.beds || '';
       const bathsDisplay = h.baths || '';
 
-      // Position tag vs subject $/sqft
       let posLabel = '', posClass = '';
       if (ppsq && subPpsq) {
         const diff = Math.round(((subPpsq - ppsq) / ppsq) * 100);
@@ -5194,16 +4262,13 @@ function populatePanel(result, listingData) {
         else                { posLabel = `At market`;               posClass = 'fair'; }
       }
 
-      // Shorten address: strip state/zip, strip city if Winter Garden
-      // Full address — keep city, state, zip
       const addrShort = (h.addr||'').trim();
 
-      // Build Zillow URL: prefer scraped url, then zpid, then construct from address slug
       const addrSlug = (h.addr || h.address || '').trim()
-        .replace(/,/g, '')           // remove commas
-        .replace(/\s+/g, '-')        // spaces to dashes
-        .replace(/[^a-zA-Z0-9-]/g, '') // strip special chars
-        .replace(/-+/g, '-');        // collapse multiple dashes
+        .replace(/,/g, '')           
+        .replace(/\s+/g, '-')        
+        .replace(/[^a-zA-Z0-9-]/g, '') 
+        .replace(/-+/g, '-');        
       const compUrl = h.url
         || (h.zpid ? `https://www.zillow.com/homedetails/${addrSlug}/${h.zpid}_zpid/` : '')
         || (addrSlug ? `https://www.zillow.com/homes/${addrSlug}_rb/` : '');
@@ -5219,7 +4284,6 @@ function populatePanel(result, listingData) {
       </div>`;
     }).join('');
 
-    // Badge: subject $/sqft vs comp median
     const compPpsqs = comps.map(h => {
       const p = h.priceNum || parseInt((h.price||'').replace(/[^0-9]/g,''), 10) || 0;
       const sqftStr = (h.sqft||'').toLowerCase();
@@ -5241,21 +4305,14 @@ function populatePanel(result, listingData) {
     }
 
     if (compBoxes) {
-      // Split comps into first-6 visible + expandable rest
       const boxArr = compBoxes.split(/(?=<div class="ch-comp-box)/).filter(Boolean);
       const first6 = boxArr.slice(0, 6).join('');
       const rest   = boxArr.slice(6).join('');
       caEl.innerHTML = `<div class="ch-comp-grid">${first6}</div>` +
         (rest ? `
           <div id="ch-comp-more" class="ch-comp-grid" style="display:none;">${rest}</div>
-          <button class="ch-comp-expand" onclick="
-            const m=this.previousElementSibling;
-            const open=m.style.display!=='none';
-            m.style.display=open?'none':'flex';
-            this.textContent=open?'Show ${boxArr.length - 5} more ▾':'Show less ▴';
-          ">Show ${boxArr.length - 5} more ▾</button>` : '');
+          <button class="ch-comp-expand" data-comp-expand data-more="${boxArr.length - 6}">Show ${boxArr.length - 6} more ▾</button>` : '');
     } else {
-      // Detect if this is a Showcase listing (they suppress the Similar Homes section)
       const isShowcase = !!(
         document.querySelector('[class*="showcase" i], [data-testid*="showcase" i]') ||
         Array.from(document.querySelectorAll('span, div, p')).find(el =>
@@ -5269,9 +4326,7 @@ function populatePanel(result, listingData) {
     }
   }
 
-  // Risks
   const risks = result.risks || [];
-  // Inject AI photo flag as a synthetic low-severity risk if detected
   if (listingData.hasAiPhotos) {
     const alreadyFlagged = risks.some(r => /AI|virtual stag|photo/i.test(r.title || ''));
     if (!alreadyFlagged) {
@@ -5283,7 +4338,6 @@ function populatePanel(result, listingData) {
     }
   }
   const highCount = risks.filter(r => r.severity === 'high').length;
-  // Force-filter: remove any risk whose title or explanation mentions generic inspection contingency
   const filteredRisks = risks.filter(r => {
     const combo = ((r.title || '') + ' ' + (r.explanation || '')).toLowerCase();
     return !(/request inspection contingency/i.test(combo) || /ask seller to address high.severity/i.test(combo));
@@ -5301,11 +4355,9 @@ function populatePanel(result, listingData) {
         </div>`).join('')}`
     : '<div class="ch-empty-state">No significant risks identified.</div>';
 
-  // Actions — now standalone "What To Do Next" section
   const actionsSection = shadow.querySelector('#ch-actions-section');
   const actions = result.actions || [];
   const filteredActions = actions.filter(a => !/request inspection contingency/i.test(a) && !/ask seller to address/i.test(a));
-  // Prepend the inspection bullet recycled from buyer strategy points
   if (inspectionBullet) filteredActions.unshift(inspectionBullet.replace(/^[\-–•*▸]\s*/, ''));
   if (actionsSection && filteredActions.length > 0) actionsSection.style.display = '';
   const actionsEl = shadow.querySelector('#ch-actions-content');
@@ -5313,7 +4365,6 @@ function populatePanel(result, listingData) {
     ? `<ul class="ch-opp-bullets">${filteredActions.map(a => `<li>${a}</li>`).join('')}</ul>`
     : '';
 
-  // FSBO
   const fsboGuidance = result.fsboGuidance;
   if (fsboGuidance && Array.isArray(fsboGuidance) && fsboGuidance.length > 0) {
     const fsboSection = shadow.querySelector('#ch-fsbo-section');
@@ -5323,19 +4374,9 @@ function populatePanel(result, listingData) {
       `<ul class="ch-actions-list">${fsboGuidance.map(a => `<li class="ch-action-item"><span class="ch-action-check">○</span>${a}</li>`).join('')}</ul>`;
   }
 
-  shadow.querySelector('#ch-print-btn')?.addEventListener('click', () => {
-    printAnalysis(shadow, listingData);
-  });
-  const dlBtn = shadow.querySelector('#ch-downloadlogs-btn');
-  if (dlBtn && !dlBtn.dataset.chWired) {
-    dlBtn.dataset.chWired = '1';
-    dlBtn.addEventListener('click', () => downloadDiagnosticLogs(listingData));
-  }
 }
 
 
-// ── Sold panel population ─────────────────────────────────────────────────────
-// ── Sold panel population ─────────────────────────────────────────────────────
 function populateSoldPanel(result, listingData, shadow) {
   const analyzingBadge = shadow.querySelector('#ch-analyzing-badge');
   if (analyzingBadge) analyzingBadge.style.display = 'none';
@@ -5513,7 +4554,6 @@ function populateSoldPanel(result, listingData, shadow) {
     });
   });
 
-  // Comparable Homes (bed+bath matched, linkable, same as For Sale/Rent)
   const soldCompsEl = resultsEl.querySelector('#ch-sold-comps-content');
   const allSoldComps = listingData.nearbyHomes || [];
   const pBeds = v => parseInt((v || '0').toString().replace(/[^0-9]/g,'')) || 0;
@@ -5544,13 +4584,11 @@ function populateSoldPanel(result, listingData, shadow) {
     soldCompsEl.innerHTML = '<div class="ch-empty-state">No comparable homes found nearby.</div>';
   }
 
-  // Print button
   resultsEl.querySelector('#ch-sold-print-btn')?.addEventListener('click', () => {
     printAnalysis(shadow, listingData);
   });
 }
 
-// ── Rent panel population ─────────────────────────────────────────────────────
 function populateRentPanel(result, listingData, shadow) {
   const analyzingBadge = shadow.querySelector('#ch-analyzing-badge');
   if (analyzingBadge) analyzingBadge.style.display = 'none';
@@ -5580,11 +4618,9 @@ function populateRentPanel(result, listingData, shadow) {
   const infoRow = (label, val) => val
     ? `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:0.5px solid var(--border);font-size:10.5px;line-height:1.4;"><span style="color:var(--text-3);flex-shrink:0;width:75px;">${label}</span><span style="color:var(--text-1);flex:1;text-align:right;">${val}</span></div>` : '';
 
-  // Scraped rent Zestimate (directly from listing data, independent of AI response)
   const scrapedRentZest = listingData.rentZestimate || 0;
   const rentAmt = listingData.rentPrice || (listingData.price > 0 && listingData.price <= 50000 ? listingData.price : 0);
 
-  // ── Rent affordability bar (matches For Sale visual) ──
   const rentTakehome = result._monthlyTakehome || listingData.userProfile?.monthlyTakehome || 0;
   const rentDebts = listingData.userProfile?.monthlyDebts || 0;
   const rentDisc = listingData.userProfile?.monthlyDiscretionary || 0;
@@ -5806,14 +4842,12 @@ function populateRentPanel(result, listingData, shadow) {
     });
   });
 
-  // Populate Similar Homes for Rent (bed+bath matched, linkable, same format as For Sale)
   const rentCompsEl = resultsEl.querySelector('#ch-rent-comps-content');
   const allRentComps = listingData.nearbyHomes || [];
   const parseBeds = v => parseInt((v || '0').toString().replace(/[^0-9]/g,'')) || 0;
   const parseBaths = v => parseFloat((v || '0').toString().replace(/[^0-9.]/g,'')) || 0;
   const subBeds = parseBeds(listingData.beds || listingData.bedrooms);
   const subBaths = parseBaths(listingData.baths || listingData.bathrooms);
-  // Filter: same beds, baths within ±1
   const rentComps = subBeds > 0 ? allRentComps.filter(h => {
     const hBeds = parseBeds(h.beds);
     const hBaths = parseBaths(h.baths);
@@ -5844,65 +4878,36 @@ function populateRentPanel(result, listingData, shadow) {
     rentCompsEl.innerHTML = '<div class="ch-empty-state">No similar rental listings found nearby.</div>';
   }
 
-  // Print button
   resultsEl.querySelector('#ch-rent-print-btn')?.addEventListener('click', () => {
     printAnalysis(shadow, listingData);
   });
 }
 
 function showNoKeyState() {
-  const shadow = panelHost?.shadowRoot;
-  if (!shadow) return;
-  const noKeyEl = shadow.querySelector('#ch-no-key');
-  if (noKeyEl) noKeyEl.style.display = 'flex';
+  sendToPanel({ type: 'CH_NEEDS_KEY' });
+}
+
+function errorStateText(msg) {
+  if (!msg || msg.includes('NO_API_KEY')) return 'No API key configured — add it in the extension settings.';
+  if (msg.includes('API error 4'))        return `API error: ${msg}`;
+  if (msg.includes('Network error') || msg.includes('Failed to fetch'))
+                                          return 'Network error — click Analyze again.';
+  if (msg.includes('timed out'))          return 'The analysis timed out — click Analyze again.';
+  if (/truncat|incomplete|PARSE_ERROR/i.test(msg))
+                                          return 'The analysis was cut off before it finished. Click Analyze to run it again.';
+  return String(msg).slice(0, 160);
 }
 
 function showErrorState(msg) {
-  const shadow = panelHost?.shadowRoot;
   chLog('error_shown', { msg: String(msg).slice(0, 300) });
-  if (!shadow) return;
-  
-  shadow.querySelector('#ch-error').style.display = 'flex';
-  const badge = shadow.querySelector('#ch-analyzing-badge');
-  if (badge) badge.style.display = 'none';
-  const errEl = shadow.querySelector('#ch-error-msg');
-  if (!errEl) return;
-  if (!msg || msg.includes('NO_API_KEY')) {
-    errEl.textContent = 'No API key configured — add it in the extension settings.';
-  } else if (msg.includes('API error 4')) {
-    errEl.textContent = `API error: ${msg}`;
-  } else if (msg.includes('Network error') || msg.includes('Failed to fetch')) {
-    errEl.textContent = 'Network error — click Analyze again.';
-  } else if (msg.includes('timed out')) {
-    errEl.textContent = 'The analysis timed out — click Analyze again.';
-  } else if (/truncat|incomplete|PARSE_ERROR/i.test(msg)) {
-    errEl.textContent = 'The analysis was cut off before it finished. Click Analyze to run it again.';
-  } else {
-    errEl.textContent = msg.slice(0, 160);
-  }
+  sendToPanel({ type: 'CH_FAILED', text: errorStateText(msg) });
 }
 
 function chToast(msg) {
-  // Lightweight in-panel confirmation so the user always gets feedback.
-  try {
-    const shadow = panelHost?.shadowRoot;
-    if (!shadow) { return; }
-    let t = shadow.querySelector('#ch-toast');
-    if (!t) {
-      t = document.createElement('div');
-      t.id = 'ch-toast';
-      t.style.cssText = 'position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#1a1a1a;color:#fff;padding:10px 16px;border-radius:8px;font:600 12px -apple-system,sans-serif;z-index:2147483647;box-shadow:0 4px 16px rgba(0,0,0,.3);max-width:90%;text-align:center;';
-      shadow.appendChild(t);
-    }
-    t.textContent = msg;
-    t.style.opacity = '1';
-    clearTimeout(t._timer);
-    t._timer = setTimeout(() => { t.style.opacity = '0'; }, 3500);
-  } catch (e) {}
+  sendToPanel({ type: 'CH_TOAST', text: String(msg) });
 }
 
 function downloadDiagnosticLogs(listingData) {
-  // Build a plain-text diagnostic report for offline bug-fixing.
   const result = chLastResult || {};
   const scraped = chLastScraped || listingData || {};
   const safe = (obj) => { try { return JSON.parse(JSON.stringify(obj)); } catch (e) { return {}; } };
@@ -5966,7 +4971,6 @@ function downloadDiagnosticLogs(listingData) {
   lines.push('');
   lines.push('Coverage: ' + filledKeys + '/' + totalKeys + ' audited fields populated');
 
-  // Red-flag scan — surfaces likely capture failures and suspicious values
   const flags = [];
   if (!fv(s.description))                          flags.push('description EMPTY — AI cannot see condition/financing disclosures (e.g. roof, cash-only)');
   if (!fv(s.agentName) && !s.isFSBO)              flags.push('agentName EMPTY — listing-agent license cannot be verified');
@@ -5987,7 +4991,6 @@ function downloadDiagnosticLogs(listingData) {
   else flags.forEach(f => lines.push('  (!) ' + f));
   lines.push('');
 
-  // Agent-capture diagnostics — pinpoints which text source holds the "Listed by" block
   try {
     const dbg = (typeof _chAgentDebug !== 'undefined') ? _chAgentDebug : {};
     lines.push('[AGENT CAPTURE DEBUG]');
@@ -6019,7 +5022,7 @@ function downloadDiagnosticLogs(listingData) {
   lines.push(JSON.stringify(r, null, 2));
   lines.push('');
   lines.push('=== RAW API RESPONSE (pre-processing) ===');
-  const _rawOk = !!(r && (r.valuation || r.keyHighlights));   // parse succeeded → parsed result above is authoritative
+  const _rawOk = !!(r && (r.valuation || r.keyHighlights));   
   if (_rawOk && chLastRawResponse && chLastRawResponse.length > 2000) {
     lines.push('(parse succeeded — raw truncated to first 2,000 chars; full raw is only kept when parsing fails)');
     lines.push(chLastRawResponse.slice(0, 2000) + ' …[truncated ' + (chLastRawResponse.length - 2000) + ' chars]');
@@ -6035,7 +5038,6 @@ function downloadDiagnosticLogs(listingData) {
   chLog('logs_download_clicked', { filename, bytes: text.length });
   chToast('Preparing log download…');
 
-  // Route through the background worker (chrome.downloads bypasses page CSP).
   let done = false;
   const fallback = () => {
     if (done) return; done = true;
@@ -6061,7 +5063,6 @@ function downloadDiagnosticLogs(listingData) {
       if (chrome.runtime.lastError || !resp || !resp.ok) { fallback(); }
       else { done = true; chToast('Log saved: ' + filename); }
     });
-    // Safety: if the SW never responds, fall back after a moment.
     setTimeout(() => { if (!done) fallback(); }, 1200);
   } catch (e) {
     fallback();
@@ -6105,7 +5106,6 @@ function printAnalysis(shadow, listingData) {
     grab('#ch-risks-content',        'Risks & Considerations');
     grab('#ch-agent-content',        'Agent Validation');
   } else if (mode === 'rent') {
-    // Rent sections are inside resultsEl — grab from there
     const resultsEl = shadow.querySelector('#ch-results');
     const grabR = (id, label) => {
       const el = resultsEl?.querySelector(id);
@@ -6120,7 +5120,6 @@ function printAnalysis(shadow, listingData) {
     grabR('#ch-rent-cashflow-body',  'Landlord Cash Flow');
     grabR('#ch-rent-lnd-body',       'Landlord Intel');
     grabR('#ch-rent-rvb-body',       'Rent vs Buy');
-    // Similar Homes excluded from rent print to fit 1-page target
   } else if (mode === 'sold') {
     const resultsEl = shadow.querySelector('#ch-results');
     const grabS = (id, label) => {
@@ -6136,28 +5135,20 @@ function printAnalysis(shadow, listingData) {
     grabS('#ch-sold-hist-body',     'Listing History');
     grabS('#ch-sold-tax-body',      'Tax Snapshot');
     grabS('#ch-sold-nbhd-body',     'Neighborhood Pulse');
-    // Comparable Homes excluded from print
   }
 
-  // ── Print compaction: keep the report to one physical page, front and back ──
-  // (1) Truncate long prose leaves at a sentence boundary (~230 chars) — the full
-  //     detail lives in the panel; print is the takeaway. (2) Cap list items.
-  // (3) Flow everything after the top strip + highlights into two columns.
   const compactSection = (html, label) => {
     try {
       const tpl = document.createElement('template');
       tpl.innerHTML = html;
-      // Cap list items (risks, actions, bullets) at 5
       tpl.content.querySelectorAll('ul, ol').forEach(list => {
         const items = list.querySelectorAll(':scope > li');
         for (let i = 4; i < items.length; i++) items[i].remove();
       });
-      // Cap risk cards at 4
       const riskCards = tpl.content.querySelectorAll('.ch-risk');
       for (let i = 4; i < riskCards.length; i++) riskCards[i].remove();
-      // Truncate long text leaves at a sentence boundary
       tpl.content.querySelectorAll('p, li, div, span').forEach(el => {
-        if (el.children.length) return;                       // leaves only
+        if (el.children.length) return;                       
         const t = el.textContent || '';
         if (t.length > 190) {
           const cut = t.slice(0, 180);
@@ -6170,7 +5161,7 @@ function printAnalysis(shadow, listingData) {
   };
   sections.forEach(s => { s.html = compactSection(s.html, s.label); });
 
-  const fullWidthCount = Math.min(1, sections.length);   // only the Property Info strip stays full-width
+  const fullWidthCount = Math.min(1, sections.length);   
   const topHtml = sections.slice(0, fullWidthCount).map(s => `
     <div class="section">
       <div class="section-label">${s.label}</div>
@@ -6377,10 +5368,6 @@ ${sectionsHtml}
 </div>
 <script>window.onload = () => {
   try {
-    // Scale-to-fit: if the report slightly overflows one letter page, zoom it
-    // down so everything lands on a single page. Usable page height at 96dpi
-    // with 0.65cm margins ≈ 1005px. Only scale within readable range (>=72%);
-    // anything taller stays at full size and paginates normally (front/back).
     const target = 1005;
     const h = document.body.scrollHeight;
     if (h > target && h <= target * 1.4) {
@@ -6397,7 +5384,6 @@ ${sectionsHtml}
   window.open(url, '_blank');
 }
 
-// ── Theme ─────────────────────────────────────────────────────────────────────
 function applyTheme(theme) {
   if (!homePanel) return;
   homePanel.classList.remove('ch-light', 'ch-dark');
@@ -6405,7 +5391,6 @@ function applyTheme(theme) {
   if (theme === 'dark')  homePanel.classList.add('ch-dark');
 }
 
-// ── SVG logo ──────────────────────────────────────────────────────────────────
 const SVG_LOGO = `<svg width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg">
   <!-- Roof, with eaves that overhang the walls -->
   <path d="M2.3 10.6L11 3.1L19.7 10.6" stroke="var(--accent)" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
@@ -6415,7 +5400,6 @@ const SVG_LOGO = `<svg width="22" height="22" viewBox="0 0 22 22" fill="none" xm
   <path d="M8.1 13.9L10.2 16.0L14.3 11.7" stroke="var(--accent)" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 
-// ── Styles ────────────────────────────────────────────────────────────────────
 function getPanelStyles() {
   return `
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -6430,7 +5414,6 @@ function getPanelStyles() {
 }
 
 #ch-panel {
-  /* ── LexiSwap light (blue/slate) ── */
   --bg:           #ffffff;
   --bg-2:         #f4f6fb;
   --bg-3:         #e8edf9;
@@ -6484,7 +5467,6 @@ function getPanelStyles() {
   pointer-events: all;
 }
 
-/* Dark mode — system (LexiSwap ink/slate, the hero look) */
 @media (prefers-color-scheme: dark) {
   #ch-panel:not(.ch-light) {
     --bg:           #141821;
@@ -6541,7 +5523,6 @@ function getPanelStyles() {
   --shadow:       0 10px 44px rgba(0,0,0,0.6), 0 1px 4px rgba(0,0,0,0.4);
 }
 
-/* ── Header ── */
 .ch-header {
   display: flex;
   align-items: center;
@@ -6606,7 +5587,6 @@ function getPanelStyles() {
 }
 .ch-gear:hover { color: var(--text-1); background: var(--bg-2); transform: rotate(72deg); }
 
-/* ── Property bar ── */
 .ch-property-bar {
   padding: 8px 13px;
   background: var(--bg-2);
@@ -6649,7 +5629,6 @@ function getPanelStyles() {
   padding: 2px 6px;
 }
 
-/* ── Listing mode badges ── */
 .ch-mode-badge {
   font-family: var(--mono);
   font-size: 9px;
@@ -6672,13 +5651,11 @@ function getPanelStyles() {
   color: var(--accent);
 }
 
-/* Dark mode overrides */
 @media (prefers-color-scheme: dark) {
   .ch-mode-badge--sold { background: #4c1d95; color: #e9d5ff; }
   .ch-mode-badge--rent { background: #064e3b; color: #a7f3d0; }
 }
 
-/* ── Listing status banner — always visible above analysis ── */
 .ch-status-banner {
   padding: 7px 13px 7px;
   font-size: 10.5px;
@@ -6699,13 +5676,11 @@ function getPanelStyles() {
   .ch-status-banner--rent { background: #064e3b; color: #6ee7b7; }
 }
 
-/* ── TLDR sold/rent variants ── */
 .ch-tldr--sold { border-left: 3px solid #7c3aed; background: #f3e8ff; }
 .ch-tldr--rent { border-left: 3px solid #065f46; background: #ecfdf5; }
 .ch-tldr--sold .ch-tldr-label { color: #7c3aed; }
 .ch-tldr--rent .ch-tldr-label { color: #065f46; }
 
-/* ── TLDR verdict bar ── */
 .ch-tldr {
   padding: 10px 13px 11px;
   border-bottom: 1.5px solid var(--border);
@@ -6735,7 +5710,6 @@ function getPanelStyles() {
 .ch-tldr--fair  .ch-tldr-label  { color: var(--accent);     }
 .ch-tldr--fair  .ch-tldr-text   { color: var(--text-1);     }
 
-/* ── Property Info Bar ── */
 .ch-propinfo-bar {
   display: flex;
   flex-direction: column;
@@ -6777,7 +5751,6 @@ function getPanelStyles() {
   padding: 0 2px;
 }
 
-/* ── Commute section ── */
 .ch-commute-list { display: flex; flex-direction: column; gap: 6px; }
 .ch-commute-row {
   display: flex;
@@ -6789,7 +5762,6 @@ function getPanelStyles() {
 .ch-commute-time  { font-weight: 700; color: var(--text-1); font-size: 13px; }
 .ch-commute-dist  { color: var(--text-3); font-size: 10px; }
 
-/* ── Affordability bar redesign ── */
 .ch-afford-takehome {
   display: flex;
   align-items: baseline;
@@ -6862,7 +5834,6 @@ function getPanelStyles() {
   margin-top: 4px;
 }
 
-/* ── Sensitivity Analysis Table ── */
 .ch-sens-wrap {
   margin-top: 8px;
   padding-top: 6px;
@@ -6902,16 +5873,13 @@ function getPanelStyles() {
 .ch-sens-table tr:last-child td { border-bottom: none; }
 .ch-sens-num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
 
-/* ── Property Meta Strip (unheadered, above Key Highlights) ── */
 .ch-prop-meta-strip {
   padding: 8px 13px 6px;
   border-bottom: 0.5px solid var(--border);
 }
 
-/* ── Key Highlights section ── */
 .ch-highlights-section { border-bottom: 1.5px solid var(--border); }
 
-/* Compact property meta strip inside Key Highlights */
 .ch-meta-row {
   font-size: 10px;
   line-height: 1.5;
@@ -6970,7 +5938,6 @@ function getPanelStyles() {
   font-weight: 700;
 }
 
-/* ── Analyzing badge — inline in property bar ── */
 .ch-analyzing-badge {
   display: inline-flex;
   align-items: center;
@@ -6987,7 +5954,6 @@ function getPanelStyles() {
   margin-left: 2px;
 }
 
-/* ── Activity feed ── */
 .ch-activity {
   padding: 8px 13px 10px;
   border-bottom: 0.5px solid var(--border);
@@ -7026,7 +5992,6 @@ function getPanelStyles() {
 
 @keyframes ch-spin { to { transform: rotate(360deg); } }
 
-/* ── Manual trigger ── */
 .ch-trigger-body {
   padding: 16px 14px 18px;
   display: flex;
@@ -7079,7 +6044,6 @@ function getPanelStyles() {
   letter-spacing: 0.03em;
 }
 
-/* ── Sections ── */
 .ch-results {}
 
 .ch-section {
@@ -7109,7 +6073,6 @@ function getPanelStyles() {
   white-space: nowrap;
 }
 
-/* Status badge — always visible in header, even when section collapsed */
 .ch-section-status {
   font-family: var(--mono);
   font-size: 9px;
@@ -7128,7 +6091,6 @@ function getPanelStyles() {
 .ch-section-status--neutral  { background: var(--bg-2);       color: var(--text-3);     }
 .ch-section-status--good     { background: #e8f5e9;           color: #2e7d32;           }
 
-/* Spacer pushes toggle to far right */
 .ch-section-spacer { flex: 1; }
 
 .ch-toggle {
@@ -7153,7 +6115,6 @@ function getPanelStyles() {
   display: none;
 }
 
-/* ── Valuation ── */
 .ch-valuation-row {
   display: flex;
   align-items: center;
@@ -7241,7 +6202,6 @@ function getPanelStyles() {
   line-height: 1.45;
 }
 
-/* ── Buyer Strategy ── */
 .ch-opp-bullets {
   list-style: none;
   padding: 0;
@@ -7274,7 +6234,6 @@ function getPanelStyles() {
   border-radius: 4px;
 }
 
-/* ── Risk flags ── */
 .ch-risk {
   margin-bottom: 8px;
   padding: 8px 10px;
@@ -7331,7 +6290,6 @@ function getPanelStyles() {
   line-height: 1.45;
 }
 
-/* ── Actions ── */
 .ch-actions-list {
   list-style: none;
   margin: 0;
@@ -7381,13 +6339,11 @@ function getPanelStyles() {
 .ch-downloadlogs-btn:hover { background: var(--bg-3, var(--bg-2)); color: var(--text-1); }
 @media print { .ch-print-bar { display: none !important; } }
 
-/* ── FSBO section ── */
 .ch-fsbo-section {
   border-top: 0.5px solid var(--border);
   border-bottom: none;
 }
 
-/* ── Empty state ── */
 .ch-empty-state {
   font-size: 10px;
   color: var(--text-3);
@@ -7395,7 +6351,6 @@ function getPanelStyles() {
   padding: 4px 0;
 }
 
-/* ── Affordability grid ── */
 .ch-afford-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -7403,7 +6358,6 @@ function getPanelStyles() {
   margin-bottom: 8px;
 }
 
-/* Comparable boxes */
 .ch-comp-grid {
   display: flex;
   flex-direction: column;
@@ -7502,7 +6456,6 @@ function getPanelStyles() {
   line-height: 1.2;
 }
 
-/* ── All-in total row (sold/rent panels) ── */
 .ch-piti-total {
   display: flex;
   justify-content: space-between;
@@ -7515,7 +6468,6 @@ function getPanelStyles() {
   color: var(--text-1);
 }
 
-/* ── Risk item (used by sold/rent panels) ── */
 .ch-risk-item {
   border-left: 2.5px solid var(--border);
   padding: 6px 8px;
@@ -7523,7 +6475,6 @@ function getPanelStyles() {
   margin-bottom: 6px;
 }
 
-/* ── Affordability total ── */
 .ch-afford-total {
   font-size: 11px;
   color: var(--text-2);
@@ -7533,7 +6484,6 @@ function getPanelStyles() {
 .ch-afford-total strong { color: var(--text-1); }
 .ch-dti-warn { color: var(--amber) !important; }
 
-/* ── Price history appreciation ── */
 .ch-appreciation-row {
   display: flex;
   align-items: center;
@@ -7544,7 +6494,6 @@ function getPanelStyles() {
 .ch-appr-val   { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--text-1); }
 .ch-appr-high  { color: var(--amber); }
 
-/* ── Price History compact stat row ── */
 .ch-pha-stat-row {
   display: flex;
   gap: 6px;
@@ -7578,7 +6527,6 @@ function getPanelStyles() {
   white-space: nowrap;
 }
 
-/* ── Agent validation ── */
 .ch-mls-row {
   display: flex;
   align-items: baseline;
@@ -7639,7 +6587,6 @@ function getPanelStyles() {
 .ch-agent-status--inactive   { background: var(--red-bg);    color: var(--red-text);   }
 .ch-agent-status--unverified { background: var(--amber-bg);  color: var(--amber-text); }
 
-/* ── Tax sub-label ── */
 .ch-tax-sub {
   font-size: 9px;
   color: var(--text-3);
@@ -7651,7 +6598,6 @@ function getPanelStyles() {
   font-weight: 400;
 }
 
-/* ── Agent / model rows ── */
 .ch-agent-row, .ch-model-row {
   font-size: 10px;
   color: var(--text-3);
@@ -7692,7 +6638,6 @@ function getPanelStyles() {
 }
 .ch-meta-dot { color: var(--text-3); padding: 0 1px; }
 
-/* ── Tax reset ── */
 .ch-tax-row {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -7752,7 +6697,6 @@ function getPanelStyles() {
   margin-bottom: 6px;
 }
 
-/* ── Error ── */
 .ch-error {
   display: none;
   flex-direction: column;
@@ -7765,7 +6709,6 @@ function getPanelStyles() {
 }
 .ch-error-icon { font-size: 20px; }
 
-/* ── No key ── */
 .ch-no-key {
   display: none;
   flex-direction: column;
@@ -7778,7 +6721,6 @@ function getPanelStyles() {
 .ch-no-key-text { font-size: 11px; color: var(--text-2); line-height: 1.5; }
 .ch-no-key-hint { font-size: 10px; color: var(--text-3); }
 
-/* ── Legal Disclaimers ── */
 .ch-legal {
   padding: 10px 13px;
   font-size: 8px;
@@ -7789,7 +6731,6 @@ function getPanelStyles() {
 .ch-legal p { margin: 0 0 4px; }
 .ch-legal p:last-child { margin-bottom: 0; }
 
-/* ── Footer ── */
 .ch-footer {
   display: flex;
   align-items: center;

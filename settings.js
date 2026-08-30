@@ -1,4 +1,3 @@
-// Clear Home — Settings Script v1.4.1
 
 const toggleEnabled  = document.getElementById('toggle-enabled');
 const apiKeyInput    = document.getElementById('api-key-input');
@@ -11,7 +10,6 @@ const clearStatsBtn  = document.getElementById('clear-stats-btn');
 const profileStatus  = document.getElementById('profile-status');
 const priorityGrid   = document.getElementById('priority-grid');
 
-// Profile fields
 const annualIncome    = document.getElementById('annual-income');
 const monthlyTakehome = document.getElementById('monthly-takehome');
 const monthlyHousing  = document.getElementById('monthly-housing');
@@ -26,7 +24,6 @@ const homesteadExempt = document.getElementById('homestead-exemption');
 const transferExempt  = document.getElementById('transfer-exemption');
 const priceCheckMode  = document.getElementById('price-check-mode');
 const offerStrategy   = document.getElementById('offer-strategy');
-const aiModelSelect   = document.getElementById('ai-model-select');
 const aiFastToggle    = document.getElementById('ai-fast-mode-toggle');
 const aiFastModeRow   = document.getElementById('ai-fast-mode-row');
 const floodToggle     = document.getElementById('flood-insurance-toggle');
@@ -34,37 +31,22 @@ const commuteStatus   = document.getElementById('commute-status');
 let activeProvider = 'anthropic';
 let apiKeys = { anthropic: '', openai: '' };
 
-const PROVIDER_MODELS = {
-  openai: [
-    ['gpt-5.6-terra', 'GPT-5.6 Terra'],
-    ['gpt-5.6-sol', 'GPT-5.6 Sol'],
-    ['gpt-5.6-luna', 'GPT-5.6 Luna']
-  ],
-  anthropic: [
-    ['claude-sonnet-5', 'Sonnet 5'],
-    ['claude-opus-4-6', 'Opus 4.6'],
-    ['claude-opus-4-8', 'Opus 4.8']
-  ]
+const PROVIDER_MODEL = {
+  openai:    'gpt-5.6-terra',
+  anthropic: 'claude-sonnet-5',
 };
 
-function renderProviderSettings(preferredModel) {
+function renderProviderSettings() {
   activeProvider = aiProviderSelect?.value === 'openai' ? 'openai' : 'anthropic';
   if (apiKeyLabel) apiKeyLabel.textContent = activeProvider === 'openai' ? 'OpenAI API Key' : 'Anthropic API Key';
   apiKeyInput.placeholder = activeProvider === 'openai' ? 'sk-…' : 'sk-ant-api03-…';
   apiKeyInput.value = apiKeys[activeProvider] || '';
   keyStatus.textContent = apiKeyInput.value ? 'API key saved ✓' : 'Enter your API key to enable AI analysis.';
   keyStatus.className = apiKeyInput.value ? 'key-status saved' : 'key-status';
-  if (aiModelSelect) {
-    aiModelSelect.innerHTML = PROVIDER_MODELS[activeProvider]
-      .map(([value, label]) => `<option value="${value}">${label}</option>`).join('');
-    const allowed = PROVIDER_MODELS[activeProvider].some(([value]) => value === preferredModel);
-    aiModelSelect.value = allowed ? preferredModel : (activeProvider === 'openai' ? 'gpt-5.6-terra' : 'claude-sonnet-5');
-  }
   if (aiFastToggle) aiFastToggle.disabled = activeProvider !== 'openai';
   if (aiFastModeRow) aiFastModeRow.style.opacity = activeProvider === 'openai' ? '1' : '0.55';
 }
 
-// ── Load saved settings ───────────────────────────────────────────────────────
 chrome.storage.sync.get(['ch_enabled', 'ch_theme', 'ch_api_key', 'ch_profile', 'ch_priorities', 'ch_commute', 'ch_prefs'], (res) => {
   toggleEnabled.checked = res.ch_enabled !== false;
 
@@ -75,13 +57,11 @@ chrome.storage.sync.get(['ch_enabled', 'ch_theme', 'ch_api_key', 'ch_profile', '
   activeProvider = prefs.aiProvider === 'openai' ? 'openai' : 'anthropic';
   if (aiProviderSelect) aiProviderSelect.value = activeProvider;
 
-  // Provider keys live in storage.local (device-only, not synced across machines).
-  // Migrate the legacy key into the Anthropic slot.
   chrome.storage.local.get(['ch_api_key', 'ch_api_keys'], (loc) => {
     apiKeys = { anthropic: loc.ch_api_keys?.anthropic || loc.ch_api_key || res.ch_api_key || '', openai: loc.ch_api_keys?.openai || '' };
     if (!loc.ch_api_keys || res.ch_api_key) {
       chrome.storage.local.set({ ch_api_keys: apiKeys, ch_api_key: apiKeys.anthropic });
-      chrome.storage.sync.remove('ch_api_key'); // remove synced copy of the secret
+      chrome.storage.sync.remove('ch_api_key'); 
     }
     renderProviderSettings(prefs.aiModel);
   });
@@ -106,17 +86,14 @@ chrome.storage.sync.get(['ch_enabled', 'ch_theme', 'ch_api_key', 'ch_profile', '
     updateAffordabilityPreview(p);
   }
 
-  // Load prefs
   if (priceCheckMode) priceCheckMode.value = prefs.priceCheckMode || 'fair_value';
   if (offerStrategy) offerStrategy.value = prefs.offerStrategy || 'competitive';
-  const migratedModel = prefs.aiModel === 'claude-sonnet-4-6' ? 'claude-sonnet-5' : prefs.aiModel;
-  renderProviderSettings(migratedModel);
+  renderProviderSettings();
   const aiEffortSelect = document.getElementById('ai-effort-select');
   if (aiEffortSelect) aiEffortSelect.value = prefs.analysisEffort || 'low';
   if (aiFastToggle)   aiFastToggle.checked = prefs.fastMode !== false;
   if (floodToggle)    floodToggle.checked  = prefs.floodInsurance || false;
 
-  // Load commute addresses
   const commute = res.ch_commute || {};
   const commuteFields = ['work1','work2','flex1','flex2','flex3'];
   commuteFields.forEach(key => {
@@ -130,28 +107,24 @@ chrome.storage.sync.get(['ch_enabled', 'ch_theme', 'ch_api_key', 'ch_profile', '
     commuteStatus.className   = 'profile-status saved';
   }
 
-  // Load priorities
   const saved = res.ch_priorities || [];
   priorityGrid?.querySelectorAll('.priority-chip').forEach(chip => {
     if (saved.includes(chip.dataset.priority)) chip.classList.add('active');
   });
 });
 
-// ── Load stats ────────────────────────────────────────────────────────────────
 chrome.storage.local.get(['ch_events'], (res) => {
   const events = res.ch_events || [];
   document.getElementById('stat-listings').textContent  = events.filter(e => e.event === 'listing_viewed').length;
   document.getElementById('stat-analyses').textContent  = events.filter(e => e.event === 'analysis_generated').length;
 });
 
-// ── Toggle enabled ────────────────────────────────────────────────────────────
 toggleEnabled.addEventListener('change', () => {
   const enabled = toggleEnabled.checked;
   chrome.storage.sync.set({ ch_enabled: enabled });
   notifyTabs({ type: 'SETTINGS_CHANGED', enabled });
 });
 
-// ── API key ───────────────────────────────────────────────────────────────────
 let keyTimeout;
 apiKeyInput.addEventListener('input', () => {
   clearTimeout(keyTimeout);
@@ -181,7 +154,6 @@ keyEyeBtn.addEventListener('click', () => {
   apiKeyInput.type = apiKeyInput.type === 'password' ? 'text' : 'password';
 });
 
-// ── Profile fields — auto-save on change ─────────────────────────────────────
 const profileFields = [annualIncome, monthlyTakehome, monthlyHousing, monthlyUtil, monthlyDebts, monthlyDisc, downPaymentPct, mortgageRate, insurancePct, monthlyIns, homesteadExempt, transferExempt];
 let profileTimeout;
 profileFields.forEach(field => {
@@ -194,10 +166,8 @@ profileFields.forEach(field => {
   });
 });
 
-// ── Prefs fields — save on change ────────────────────────────────────────────
 priceCheckMode?.addEventListener('change', savePrefs);
 offerStrategy?.addEventListener('change', savePrefs);
-aiModelSelect?.addEventListener('change', savePrefs);
 document.getElementById('ai-effort-select')?.addEventListener('change', savePrefs);
 aiFastToggle?.addEventListener('change', savePrefs);
 floodToggle?.addEventListener('change', savePrefs);
@@ -206,7 +176,6 @@ aiProviderSelect?.addEventListener('change', () => {
   savePrefs();
 });
 
-// ── Commute fields — auto-save on change ─────────────────────────────────────
 let commuteTimeout;
 ['work1','work2','flex1','flex2','flex3'].forEach(key => {
   ['label','addr'].forEach(part => {
@@ -247,7 +216,7 @@ function savePrefs() {
     priceCheckMode:  priceCheckMode?.value  || 'fair_value',
     offerStrategy:   offerStrategy?.value   || 'competitive',
     aiProvider:      activeProvider,
-    aiModel:         aiModelSelect?.value   || (activeProvider === 'openai' ? 'gpt-5.6-terra' : 'claude-sonnet-5'),
+    aiModel:         PROVIDER_MODEL[activeProvider],
     analysisEffort:  document.getElementById('ai-effort-select')?.value || 'low',
     fastMode:        aiFastToggle?.checked !== false,
     floodInsurance:  floodToggle?.checked   || false,
@@ -289,7 +258,6 @@ function updateAffordabilityPreview(p) {
   }
 }
 
-// ── Housing Priorities ────────────────────────────────────────────────────────
 priorityGrid?.querySelectorAll('.priority-chip').forEach(chip => {
   chip.addEventListener('click', () => {
     chip.classList.toggle('active');
@@ -301,7 +269,6 @@ priorityGrid?.querySelectorAll('.priority-chip').forEach(chip => {
   });
 });
 
-// ── Theme ─────────────────────────────────────────────────────────────────────
 themeBtns.forEach(btn => {
   btn.addEventListener('click', () => {
     const theme = btn.dataset.theme;
@@ -312,7 +279,6 @@ themeBtns.forEach(btn => {
   });
 });
 
-// ── Clear stats ───────────────────────────────────────────────────────────────
 clearStatsBtn?.addEventListener('click', () => {
   chrome.storage.local.set({ ch_events: [] }, () => {
     document.getElementById('stat-listings').textContent  = '0';
@@ -320,7 +286,6 @@ clearStatsBtn?.addEventListener('click', () => {
   });
 });
 
-// ── Notify active tabs ────────────────────────────────────────────────────────
 function notifyTabs(msg) {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     tabs.forEach(tab => chrome.tabs.sendMessage(tab.id, msg).catch(() => {}));

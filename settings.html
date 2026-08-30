@@ -11,7 +11,7 @@
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      /* ── LexiSwap light (blue/slate) ── */
+
       --bg:       #ffffff;
       --bg-2:     #f4f6fb;
       --bg-3:     #e8edf9;
@@ -31,7 +31,7 @@
 
     @media (prefers-color-scheme: dark) {
       :root {
-        /* ── LexiSwap ink/slate ── */
+
         --bg:       #141821;
         --bg-2:     #1b2230;
         --bg-3:     #232c3e;
@@ -49,7 +49,9 @@
     }
 
     body {
-      width: 300px;
+
+      width: 100%;
+      min-width: 280px;
       background: var(--bg);
       color: var(--text-1);
       font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -96,7 +98,6 @@
       margin-bottom: 9px;
     }
 
-    /* Toggle switch */
     .toggle-row {
       display: flex;
       align-items: center;
@@ -138,7 +139,6 @@
     .toggle-switch input:checked + .toggle-track { background: var(--accent); }
     .toggle-switch input:checked + .toggle-track::after { transform: translateX(14px); }
 
-    /* API key input */
     .key-wrap {
       position: relative;
     }
@@ -182,7 +182,6 @@
     .key-status.saved { color: var(--green); }
     .key-status.error { color: var(--red); }
 
-    /* Theme selector */
     .theme-options {
       display: flex;
       gap: 6px;
@@ -265,7 +264,6 @@
       width: 100%;
     }
 
-    /* Select dropdowns — force background + color to respect light/dark theme */
     select.field-input {
       background-color: var(--bg-2);
       color: var(--text-1);
@@ -305,7 +303,6 @@
     }
     .profile-status.saved { color: var(--green); }
 
-    /* Housing priorities */
     .priority-grid {
       display: flex;
       flex-wrap: wrap;
@@ -343,7 +340,6 @@
       line-height: 1.4;
     }
 
-    /* Stats */
     .stats-row {
       display: flex;
       gap: 8px;
@@ -407,10 +403,9 @@
       <path d="M9.8 16.6L10.8 17.8L12.8 15.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
     </svg>
     <span class="header-title">Clear Home</span>
-    <span class="header-version">v1.2.0</span>
+    <span class="header-version">v1.4.6</span>
   </div>
 
-  <!-- Enable toggle -->
   <div class="section">
     <div class="section-label">Extension</div>
     <div class="toggle-row">
@@ -422,7 +417,6 @@
     </div>
   </div>
 
-  <!-- Mode Toggle -->
   <div class="section">
     <div class="section-label">Analysis Mode</div>
     <div class="field-row" style="align-items:center;justify-content:space-between;">
@@ -437,12 +431,11 @@
     </div>
   </div>
 
-  <!-- AI Provider + API Key -->
   <div class="section">
     <div class="field-row" style="align-items:center;justify-content:space-between;margin-top:0;">
       <div>
         <label class="field-label" style="margin-bottom:2px;">AI Provider</label>
-        <div class="field-hint">Use OpenAI or keep your existing Anthropic setup.</div>
+        <div class="field-hint">Anthropic runs Sonnet 5. OpenAI runs GPT-5.6 Terra.</div>
       </div>
       <select class="field-input" id="ai-provider-select" style="width:auto;min-width:160px;">
         <option value="openai">OpenAI</option>
@@ -457,7 +450,6 @@
     <div class="key-status" id="key-status">Enter your API key to enable AI analysis.</div>
   </div>
 
-  <!-- Buyer Profile -->
   <div class="section">
     <div class="section-label">Your Buyer Profile</div>
     <div class="section-hint">Used for affordability & DTI calculations on every listing.</div>
@@ -518,7 +510,6 @@
     <div class="profile-status" id="profile-status">Profile not saved.</div>
   </div>
 
-  <!-- Mortgage & Insurance -->
   <div class="section">
     <div class="section-label">Mortgage & Insurance</div>
     <div class="section-hint">Used to calculate PITI and DTI for each listing.</div>
@@ -574,27 +565,14 @@
     </div>
   </div>
 
-  <!-- Analysis Preferences -->
   <div class="section">
     <div class="section-label">Analysis Preferences</div>
     <div class="section-hint">Customize how Clear Home runs your analysis.</div>
 
     <div class="field-row" style="align-items:center;justify-content:space-between;">
       <div>
-        <label class="field-label" style="margin-bottom:2px;">AI Model</label>
-        <div class="field-hint" id="ai-model-hint">Choose a quality/cost tier for the selected provider.</div>
-      </div>
-      <select class="field-input" id="ai-model-select" style="width:auto;min-width:160px;">
-        <option value="gpt-5.6-terra">GPT-5.6 Terra</option>
-        <option value="gpt-5.6-sol">GPT-5.6 Sol</option>
-        <option value="gpt-5.6-luna">GPT-5.6 Luna</option>
-      </select>
-    </div>
-
-    <div class="field-row" style="align-items:center;justify-content:space-between;">
-      <div>
         <label class="field-label" style="margin-bottom:2px;">Analysis Effort</label>
-        <div class="field-hint">Low is faster & cheaper, plenty for most listings · High reasons more on tricky ones (Sonnet 5 / Opus 4.7+ only)</div>
+        <div class="field-hint">Low is faster and cheaper, plenty for most listings. High reasons more on tricky ones.</div>
       </div>
       <select class="field-input" id="ai-effort-select" style="width:auto;min-width:160px;">
         <option value="low">Low (fast)</option>
@@ -606,7 +584,7 @@
     <div class="field-row" id="ai-fast-mode-row" style="align-items:center;justify-content:space-between;">
       <div>
         <label class="field-label" style="margin-bottom:2px;">OpenAI Fast Mode</label>
-        <div class="field-hint">Same selected model and reasoning quality, with prioritized processing. Uses premium token pricing and falls back automatically if unavailable.</div>
+        <div class="field-hint">Same model and reasoning quality, with prioritized processing. Uses premium token pricing and falls back automatically if unavailable.</div>
       </div>
       <label class="toggle-switch">
         <input type="checkbox" id="ai-fast-mode-toggle" checked>
@@ -648,7 +626,6 @@
     </div>
   </div>
 
-  <!-- Commute Addresses -->
   <div class="section">
     <div class="section-label">Commute Addresses</div>
     <div class="section-hint">Estimated commute times will appear in your analysis for each saved address.</div>
@@ -681,7 +658,6 @@
     <div class="profile-status" id="commute-status">Addresses not saved.</div>
   </div>
 
-  <!-- Housing Priorities -->
   <div class="section">
     <div class="section-label">Housing Priorities</div>
     <div class="section-hint">Select what matters most — risks and opportunities will be weighted accordingly.</div>
@@ -698,7 +674,6 @@
     <div class="priority-hint">Selected priorities raise risk severity for related issues. E.g. Schools selected → low school rating becomes a high-severity risk.</div>
   </div>
 
-  <!-- Theme -->
   <div class="section">
     <div class="section-label">Theme</div>
     <div class="theme-options">
@@ -708,7 +683,6 @@
     </div>
   </div>
 
-  <!-- Stats -->
   <div class="section">
     <div class="section-label">Session Stats</div>
     <div class="stats-row">
