@@ -1,0 +1,14 @@
+# Chrome runs this folder directly; a zip is only ever made for a Web Store
+# upload and should never be committed or left in the tree.
+*.zip
+
+# AI process files. Agent instructions, transcripts, and scratch stay local -
+# nothing that is not a product asset belongs in this repository.
+CLAUDE.md
+.claude/
+
+# OS / editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
