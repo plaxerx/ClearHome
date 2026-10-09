@@ -311,12 +311,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
-  if (msg.type === 'PREFETCH_ANALYSIS_LOOKUPS') {
-    Promise.allSettled(prefetchAnalysisLookups(msg.data || {}))
-      .then(() => sendResponse({ ok: true }));
-    return true; 
-  }
-
   if (msg.type === 'BUILD_PROMPT') {
     const { data, apiKey } = msg;
     const keepAlive = setInterval(() => {
@@ -507,7 +501,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           licenseVerified: !!m.licenseVerifiedFinal,
           licenseStatus:   m.licenseStatusFinal || 'Unverified',
           licenseNumber:   m.agentLicenseNumber || null,
-          concerns:        m.agentConcerns || null,
+          licenseLookupUrl: m.licenseLookupUrl || null,
           recommendation:  m.agentRecommendation || ''
         };
         result._commuteResults  = m.commuteResults  || {};
@@ -564,7 +558,7 @@ function parseNum(str) {
 
 
 async function fetchLandlordIntel(listingData) {
-  const { address, landlordName, landlordCompany, parcelNumber } = listingData;
+  const { landlordName, landlordCompany } = listingData;
   const result = {
     name:            landlordName  || '',
     company:         landlordCompany || '',
@@ -576,65 +570,6 @@ async function fetchLandlordIntel(listingData) {
     scamRiskScore:   0,
     note:            ''
   };
-
-  try {
-    const state = detectStateFromAddress(address);
-    if (state === 'FL' && (parcelNumber || address)) {
-      const parcel = parcelNumber || '';
-      const ocpaUrl = parcel
-        ? `https://ocpafl.org/searches/ParcelSearch.aspx?strap=${encodeURIComponent(parcel)}`
-        : `https://ocpafl.org/searches/AddressSearch.aspx?addr=${encodeURIComponent(address?.split(',')[0] || '')}`;
-      const res = await fetch(ocpaUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/html' },
-        signal: AbortSignal.timeout(5000)
-      });
-      if (res.ok) {
-        const html = await res.text();
-        const ownerM = html.match(/Owner[^<]*<[^>]+>([^<]{5,80})</i);
-        if (ownerM) {
-          result.ownerOfRecord = ownerM[1].trim();
-          const landlordWords = (landlordName || landlordCompany || '').toLowerCase().split(/\s+/).filter(w => w.length > 2);
-          const ownerLower    = result.ownerOfRecord.toLowerCase();
-          const matchCount    = landlordWords.filter(w => ownerLower.includes(w)).length;
-          if (matchCount >= 2 || (matchCount >= 1 && landlordWords.length <= 2)) {
-            result.ownerMatchStatus = 'Matches deed ✓';
-          } else if (result.ownerOfRecord.toLowerCase().includes('llc') || result.ownerOfRecord.toLowerCase().includes('trust')) {
-            result.ownerMatchStatus = 'LLC/Trust owner — verify identity';
-            result.scamRiskScore += 1;
-          } else if (landlordWords.length > 0) {
-            result.ownerMatchStatus = 'Name mismatch — verify';
-            result.scamRiskScore += 2;
-          }
-        }
-      }
-    }
-  } catch(e) {}
-
-  if (landlordCompany && !listingData.isPrivateLandlord) {
-    try {
-      const state = detectStateFromAddress(address);
-      if (state === 'FL') {
-        const csvUrl = 'https://www.myfloridalicense.com/DBPR/solutions/RealtorServices/COMMUNITYASSOCIATION2501LICENSE_1.csv';
-        const res = await fetch(csvUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-          signal: AbortSignal.timeout(8000)
-        });
-        if (res.ok) {
-          const text    = await res.text();
-          const lines   = text.split('\n');
-          const company = landlordCompany.toLowerCase();
-          const found   = lines.find(l => l.toLowerCase().includes(company.slice(0, 15)));
-          if (found) {
-            const cols = found.split(',');
-            result.licenseStatus = cols[12] === 'Current' ? 'Active (CAM)' : 'Inactive (CAM)';
-            if (cols[12] !== 'Current') result.scamRiskScore += 2;
-          } else {
-            result.licenseStatus = 'Not found in FL CAM registry';
-          }
-        }
-      }
-    } catch(e) {}
-  }
 
   const price = listingData.price || 0;
   const rz    = listingData.rentZestimate || 0;
@@ -1313,88 +1248,13 @@ function getAppreciationForDate(dateStr, msaKey) {
   return null;
 }
 
-// A public-record host that hangs instead of failing used to stall the prompt build, which waits on
-// these lookups and is abandoned by the content script after 30s. No request may hold it longer than this.
+// Commute lookups (Nominatim, OSRM) are awaited by the prompt build, which the content script
+// abandons after 30s, so no single request may hold it longer than this.
 const LOOKUP_FETCH_TIMEOUT_MS = 20000;
-const LOOKUP_DEADLINE_MS = 20000;
 
-// fetch() with the lookup timeout, also aborted by `signal` (firstInOrder cancelling a lower-priority source).
-// The timeout keeps running after headers arrive, so it bounds the body read too.
-function lookupFetch(url, init = {}, signal = null) {
-  const ctrl = new AbortController();
-  for (const s of [AbortSignal.timeout(LOOKUP_FETCH_TIMEOUT_MS), signal]) {
-    if (!s) continue;
-    if (s.aborted) ctrl.abort();
-    else s.addEventListener('abort', () => ctrl.abort(), { once: true });
-  }
-  return fetch(url, { ...init, signal: ctrl.signal });
-}
-
-// Starts every source at once and resolves with the first non-null result in list order, the same
-// answer a sequential try-each-in-turn loop gives, in the time of the slowest source it had to wait on
-// rather than the sum. Sources after the winner are aborted.
-function firstInOrder(tasks) {
-  const ctrls = tasks.map(() => new AbortController());
-  const runs = tasks.map((task, i) => Promise.resolve().then(() => task(ctrls[i].signal)).catch(() => null));
-  return (async () => {
-    for (let i = 0; i < runs.length; i++) {
-      const r = await runs[i];
-      if (r != null) { ctrls.slice(i + 1).forEach(c => c.abort()); return r; }
-    }
-    return null;
-  })();
-}
-
-function withDeadline(promise, ms) {
-  let timer;
-  return Promise.race([
-    promise,
-    new Promise(r => { timer = setTimeout(() => r(null), ms); })
-  ]).finally(() => clearTimeout(timer));
-}
-
-const ANALYSIS_LOOKUP_TTL_MS = 10 * 60 * 1000;
-const analysisLookupCaches = {
-  county: new Map(),
-  agent: new Map(),
-  mls: new Map()
-};
-
-function normalizedLookupPart(value) {
-  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
-}
-
-function analysisLookupKeys(data = {}) {
-  const state = normalizedLookupPart(detectStateFromAddress(data.address) || data.propertyState || data.state);
-  return {
-    county: normalizedLookupPart(data.parcelNumber),
-    agent: [state, normalizedLookupPart(data.agentName), normalizedLookupPart(data.brokerageName)].join('|'),
-    mls: [normalizedLookupPart(data.mlsId), normalizedLookupPart(data.mlsSource || data.originatingMls)].join('|')
-  };
-}
-
-function cachedAnalysisLookup(cache, key, factory) {
-  if (!key || key.replace(/\|/g, '') === '') return Promise.resolve(null);
-  const now = Date.now();
-  const existing = cache.get(key);
-  if (existing && now - existing.createdAt < ANALYSIS_LOOKUP_TTL_MS) return existing.promise;
-  const promise = Promise.resolve().then(factory);
-  cache.set(key, { createdAt: now, promise });
-  return promise;
-}
-
-function getAnalysisLookupPromises(data = {}) {
-  const keys = analysisLookupKeys(data);
-  return [
-    cachedAnalysisLookup(analysisLookupCaches.county, keys.county, () => fetchCountyData(data)),
-    cachedAnalysisLookup(analysisLookupCaches.agent, keys.agent, () => fetchAgentLicense(data)),
-    cachedAnalysisLookup(analysisLookupCaches.mls, keys.mls, () => verifyMLS(data))
-  ];
-}
-
-function prefetchAnalysisLookups(data = {}) {
-  if ((data.listingMode || 'buy') !== 'buy') return [];
-  return getAnalysisLookupPromises(data);
+// fetch() with the lookup timeout. The timeout keeps running after headers arrive, so it bounds the body read too.
+function lookupFetch(url, init = {}) {
+  return fetch(url, { ...init, signal: AbortSignal.timeout(LOOKUP_FETCH_TIMEOUT_MS) });
 }
 
 async function analyzeProperty(listingData, apiKey) {
@@ -1412,15 +1272,7 @@ async function analyzeProperty(listingData, apiKey) {
   const mortgageRatePromise = getMortgageRate().catch(() => null);
   const commutePromise = fetchCommuteEstimates(listingData.address, listingData.userProfile?.commuteAddrs || {});
 
-  // A lookup still running at the deadline is treated as not found; it keeps going and lands in the cache.
-  const [countyResult, agentResult, mlsResult] = await Promise.allSettled(
-    getAnalysisLookupPromises(listingData).map(p => withDeadline(p, LOOKUP_DEADLINE_MS))
-  );
-
-  const county = countyResult.status === 'fulfilled' ? countyResult.value : null;
-  const agent  = agentResult.status  === 'fulfilled' ? agentResult.value  : null;
   const comps  = null; 
-  const mls    = mlsResult.status    === 'fulfilled' ? mlsResult.value    : null;
 
   const {
     address, price, sqft, beds, baths, bathsDetail, description,
@@ -1490,7 +1342,7 @@ async function analyzeProperty(listingData, apiKey) {
   };
   const propertyState    = detectStateFromAddress(address);
   const defaultTaxRate   = stateTaxRates[propertyState] || 0.011; 
-  const publicAssessed   = county?.assessedValue || 0;
+  const publicAssessed   = taxHistory?.[0]?.assessed || 0;
   const listingAssessed  = taxAssessedValueListing || 0;
   const publicTax        = taxHistory?.[0]?.taxPaid || 0;
   const listingTax       = parseNum(String(taxAnnualAmountListing || 0));
@@ -1511,7 +1363,7 @@ async function analyzeProperty(listingData, apiKey) {
     : null;
 
   const NEW_OWNER_MULTIPLIER = 2.0;
-  const countyInfo = resolveCountyTaxRate(address, propertyState);
+  const countyInfo = resolveCountyTaxRate(address, propertyState, listingData.county);
   const publishedRate = countyInfo.rate || defaultTaxRate;
   const fallbackRate = publishedRate * NEW_OWNER_MULTIPLIER;
 
@@ -1638,31 +1490,16 @@ async function analyzeProperty(listingData, apiKey) {
       }).join('\n')
     : 'Not available — Similar Homes section not found on page';
 
-  const mlsStr = mls
-    ? `MLS Status: ${mls.status || 'Unknown'} | Listed: ${mls.listDate || 'Unknown'} | Days: ${mls.daysOnMarket || 'Unknown'} | Agent MLS ID: ${mls.agentMlsId || 'Unknown'}`
-    : `MLS# ${listingData.mlsId || 'Unknown'}${listingData.mlsSource ? ' on ' + listingData.mlsSource : ''} — verification not completed`;
-
   const zestStr = listingData.zestimate > 0
     ? `$${Number(listingData.zestimate).toLocaleString()} (range: $${Number(listingData.zestimateRange?.low||0).toLocaleString()} – $${Number(listingData.zestimateRange?.high||0).toLocaleString()})`
     : 'Not available';
 
-  const agentValidationStr = agent?.licenseNumber
-    ? [
-        `License: ${agent.licenseNumber}`,
-        `Type: ${agent.licenseType || 'Unknown'}`,
-        `Active: ${agent.isActive ? 'YES' : 'NO'}`,
-        `Renewal status: ${agent.renewalStatus || 'Unknown'}`,
-        `Expires: ${agent.expiry || 'Unknown'}`,
-        `Employer on file: ${agent.employer || 'Unknown'}`,
-        `County: ${agent.county || 'Unknown'}`,
-        `Source: ${agent.source}`,
-        agent.concerns?.length ? `⚠ Concerns: ${agent.concerns.join('; ')}` : 'No concerns found'
-      ].join(' | ')
-    : `Unverified — DBPR CSV lookup failed. Manual check: myfloridalicense.com (search: ${agentName})`;
-
-  const countyStr = county?.assessedValue > 0
-    ? `County assessed: $${Number(county.assessedValue).toLocaleString()} | Market value: $${Number(county.marketValue||0).toLocaleString()} | Owner: ${county.ownerName||'Unknown'} | Exemptions: ${county.exemptions||'None'} | Source: ${county.source}`
-    : `County lookup not completed — parcel ${listingData.parcelNumber || 'unknown'}. Use ocpafl.org to verify.`;
+  const licenseLookupUrl = getStateLicenseLookupUrl(propertyState, agentName);
+  const licenseBoard = propertyState ? `the ${propertyState} real estate licensing board` : 'the state real estate licensing board';
+  const agentLicenseNumber = listingData.agentLicenseNumber || '';
+  const agentValidationStr = agentLicenseNumber
+    ? `License # ${agentLicenseNumber} as printed on the listing; not checked against the state record. Manual check with ${licenseBoard}: ${licenseLookupUrl}`
+    : `No license number on the listing; not auto-verified. Manual check with ${licenseBoard}: ${licenseLookupUrl}`;
 
   const schoolSource = (Array.isArray(listingData.schools) && listingData.schools.length)
     ? listingData.schools
@@ -2016,9 +1853,6 @@ ${taxPreComputedStr}
 ${priceHistStr}
 ${appreciationNote}
 
-═══ MLS VERIFICATION ═══
-${mlsStr}
-
 ═══ SIMILAR HOMES (Zillow Similar Homes section — source of truth for comps) ═══
 ${compsStr}
 
@@ -2042,9 +1876,6 @@ Agent: ${agentName || 'Unknown'} | Phone: ${agentPhone || 'Unknown'}
 Brokerage: ${brokerageName || 'Unknown'}
 ${/highly motivated|must sell|motivated seller|price reduced|bring all offers|won't last|priced to sell/i.test(description||'') ? '⚠ MOTIVATED SELLER SIGNAL detected in description — apply 5-10% additional discount to recommended offer price based on desperation level (5% = soft signal, 10% = urgent/multiple signals)' : ''}
 License Validation: ${agentValidationStr}
-
-═══ COUNTY RECORDS ═══
-${countyStr}
 
 ═══ PROPERTY DETAILS ═══
 Interior: ${interiorFeatures || 'Not listed'}
@@ -2120,7 +1951,7 @@ CRITICAL: emit the fields IN THE ORDER GIVEN. oneLineSummary and keyHighlights c
   },
   "taxEstimate": {
     "taxDataConflict": <boolean>,
-    "note": <1 complete sentence using the pre-computed numbers. For FL properties, the estimate uses a 90% assessment ratio and (for primary residences) the $50K homestead exemption applied to the county millage rate — reference this method briefly if relevant. Do NOT recompute; use the "Post-purchase tax estimate" figure as given.>
+    "note": <1 complete sentence using the pre-computed numbers. The estimate applies the rate in "Estimate method" to the purchase price, less any exemptions listed there — reference this method briefly if relevant. Do NOT recompute; use the "Post-purchase tax estimate" figure as given.>
   },
   "affordability": {
     "verdict": <"Affordable"|"Borderline"|"Stretched"|"Unknown">,
@@ -2172,7 +2003,7 @@ Rules:
 - TODAY is ${TODAY}. Never flag dates on or before today as future.
 - ANTI-HALLUCINATION RULE: Never invent data not present in the listing or pre-computed signals. This includes:
   * Bath count: use the value from the "Baths:" field exactly as provided. If it shows "3 full, 1 half" use that exact phrasing in commentary. If it shows "3.5" treat as 3 full + 1 half (the .5 represents half baths). If just an integer like "3", do NOT add .5 or interpret as 3.5. Never report counts like "31" — that's a parsing error; use the integer part only.
-  * FHFA MSA: use ONLY the msaLabel from the macroAppreciation section. NEVER reference "New York-Newark" or any other MSA than the one provided. For Winter Garden FL it is "Orlando-Kissimmee MSA". If you cannot find msaLabel, do NOT mention MSA at all.
+  * FHFA MSA: use ONLY the msaLabel from the macroAppreciation section. NEVER reference "New York-Newark" or any other MSA than the one provided. If you cannot find msaLabel, do NOT mention MSA at all.
   * Builder name: only mention if explicitly in the listing data.
   * Prior sale price/date: only use the pre-computed values, never guess.
   * Upgrade dollar values: only sum amounts the listing EXPLICITLY states. Do not estimate upgrade costs yourself.
@@ -2218,7 +2049,7 @@ Rules:
   * Tax caps: FL=Save Our Homes 3%/yr cap resets at sale; CA=Prop 13 resets at sale; TX=homestead exemption lost; most other states reassess to full sale price. Use correct state terminology.
   * Feature premiums: Pool adds value in FL/AZ/CA/TX/NV but may be neutral or negative in IL/MN/WI/NY. Impact windows only relevant in FL/Gulf Coast/coastal SE. Generator high value in FL/TX/SE for storms, moderate in Midwest for power outages, low in Pacific NW.
   * Agent licensing: State licensing boards vary — use state-specific terminology and verification sources.
-  * Macro appreciation: Orlando MSA FHFA used for FL; national index for all other states.
+  * Macro appreciation: the FHFA benchmark is the metro index named by msaLabel, or the national index where no metro index covers the property.
 - model: extract from description — "The [Word] model", "[Word] model is/offers", or Builder model field. For this listing: "${propertyModel || 'check description'}".
 - oneLineSummary: specific bid number + the pre-computed seller credit + 2-3 justifications. Use the EXACT "RECOMMENDED SELLER CREDIT (Clear Home)" figure for the credit. MUST be consistent with valuation.status. Never use dashes; use periods and commas. Format: "Offer $X with a $Y seller credit. [reason], [reason], and [reason]."`;
 
@@ -2240,29 +2071,16 @@ Rules:
   }
 
   let agentRecommendation, licenseVerifiedFinal, licenseStatusFinal;
-  const _agConcerns = (agent && Array.isArray(agent.concerns) && agent.concerns.length) ? agent.concerns.join('; ') : '';
   if (isFSBO) {
     agentRecommendation = "Engage a buyer's agent or real estate attorney, since there is no listing agent representing the seller's interests.";
     licenseVerifiedFinal = false;
     licenseStatusFinal = 'FSBO';
-  } else if (agent && agent.licenseNumber) {
-    if (agent.isActive && !_agConcerns) {
-      agentRecommendation = `License ${agent.licenseNumber} is verified and active per ${agent.source || 'the state board'}; no concerns found.`;
-      licenseStatusFinal = 'Active';
-    } else if (agent.isActive && _agConcerns) {
-      agentRecommendation = `License ${agent.licenseNumber} is active, but note: ${_agConcerns}.`;
-      licenseStatusFinal = 'Active';
-    } else {
-      agentRecommendation = `License ${agent.licenseNumber} is on file but not shown as active; confirm current standing with the state licensing board before proceeding.`;
-      licenseStatusFinal = 'Inactive';
-    }
-    licenseVerifiedFinal = !!agent.isActive;
   } else if (agentName && agentName.trim()) {
-    agentRecommendation = `The listing agent's license could not be matched automatically; confirm ${agentName.trim()}'s license directly with the state licensing board (e.g. myfloridalicense.com in FL) before proceeding.`;
+    agentRecommendation = `Confirm ${agentName.trim()}'s license is active with ${licenseBoard} before proceeding.`;
     licenseVerifiedFinal = false;
     licenseStatusFinal = 'Unverified';
   } else {
-    agentRecommendation = `This listing names only the brokerage${brokerageName ? ` (${brokerageName})` : ''} and no individual agent, so the license could not be auto-verified; identify the listing agent and confirm their license with the state board before proceeding.`;
+    agentRecommendation = `This listing names only the brokerage${brokerageName ? ` (${brokerageName})` : ''} and no individual agent; identify the listing agent and confirm their license with ${licenseBoard} before proceeding.`;
     licenseVerifiedFinal = false;
     licenseStatusFinal = 'Unverified';
   }
@@ -2277,8 +2095,8 @@ Rules:
       monthlyTakehome, priceCheckMode, floodInsurance,
       commuteResults, offerCalc, pricePerSqft,
       homesteadResetNote, agentRecommendation, licenseVerifiedFinal, licenseStatusFinal,
-      agentLicenseNumber: (agent && agent.licenseNumber) || null,
-      agentConcerns: _agConcerns || null, isFSBO
+      agentLicenseNumber: agentLicenseNumber || null,
+      licenseLookupUrl: isFSBO ? null : licenseLookupUrl, isFSBO
     }
   };
 }
@@ -2367,9 +2185,6 @@ function attemptJsonRecovery(raw) {
 }
 
 async function analyzeSold(listingData, apiKey, TODAY, TODAY_ISO) {
-  const countyResult = await fetchCountyData(listingData).catch(() => null);
-  const county = countyResult || null;
-
   const {
     address, price, sqft, beds, baths, bathsDetail, description,
     priceHistory, taxHistory, zestimate, zestimateRange,
@@ -2458,8 +2273,8 @@ async function analyzeSold(listingData, apiKey, TODAY, TODAY_ISO) {
   const appResult = getAppreciationForDate(previousSaleDate ? previousSaleDate.toISOString() : null, msaKeyS);
   const fhfaBenchmark = appResult?.pct ?? null;
 
-  const latestTax   = county?.taxPaid || taxHistory?.[0]?.taxPaid || 0;
-  const assessedVal = county?.assessedValue || taxHistory?.[0]?.assessed || 0;
+  const latestTax   = taxHistory?.[0]?.taxPaid || 0;
+  const assessedVal = taxHistory?.[0]?.assessed || 0;
 
   const priceHistStr = ph.slice(0, 12).map(h => {
     const dt = parsePHDate(h.date);
@@ -2663,12 +2478,7 @@ function finalizeSoldResult(rawText, meta) {
 }
 
 async function analyzeRent(listingData, apiKey, TODAY, TODAY_ISO) {
-  const [countyResult, landlordResult] = await Promise.allSettled([
-    fetchCountyData(listingData),
-    fetchLandlordIntel(listingData)
-  ]);
-  const county   = countyResult.status   === 'fulfilled' ? countyResult.value   : null;
-  const landlord = landlordResult.status === 'fulfilled' ? landlordResult.value : null;
+  const landlord = await fetchLandlordIntel(listingData).catch(() => null);
 
   const {
     address, sqft, beds, baths, description,
@@ -3030,310 +2840,6 @@ async function fetchCommuteEstimates(listingAddress, commuteAddrs) {
   return results;
 }
 
-async function fetchCountyData(listingData) {
-  const { parcelNumber } = listingData;
-  if (!parcelNumber) return null;
-
-  const pid = parcelNumber.replace(/[^0-9A-Z]/gi, '');
-  const base = () => ({ source: 'Orange County PA', parcel: pid });
-
-  const fromParcelCard = async (signal) => {
-    try {
-      const cardUrl = `https://www.ocpafl.org/Searches/ParcelSearch.aspx?parcel=${pid}`;
-      const res = await lookupFetch(cardUrl, {
-        headers: {
-          'Accept': 'text/html,application/xhtml+xml',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-      }, signal);
-      if (!res.ok) return null;
-      const html = await res.text();
-      const ownerM    = html.match(/(?:Owner|NAME1)["\s:]+([^"<\n]{3,60})/i);
-      const assessM   = html.match(/(?:Total Assessed|TOTAL_ASSD)["\s:$]+([0-9,]+)/i);
-      const marketM   = html.match(/(?:Total Market|TOTAL_MKT)["\s:$]+([0-9,]+)/i);
-      const taxM      = html.match(/(?:Ad Valorem Tax|TAXES)["\s:$]+([0-9,]+)/i);
-      const yearM     = html.match(/(?:Year Built|YR_BLT)["\s:]+(\d{4})/i);
-      const sqftM     = html.match(/(?:Living Area|TOT_LVG_AR|Sq\.?\s*Ft)["\s:]+([0-9,]+)/i);
-      const exemptM   = html.match(/(?:Exemption|EXMPT)["\s:]+([^"<\n]{2,40})/i);
-      if (!ownerM && !assessM) return null;
-
-      const result = base();
-      if (ownerM)  result.ownerName     = ownerM[1].trim();
-      if (assessM) result.assessedValue = parseFloat(assessM[1].replace(/,/g, ''));
-      if (marketM) result.marketValue   = parseFloat(marketM[1].replace(/,/g, ''));
-      if (taxM)    result.annualTax     = parseFloat(taxM[1].replace(/,/g, ''));
-      if (yearM)   result.yearBuiltCounty = yearM[1];
-      if (sqftM)   result.sqftCounty    = parseFloat(sqftM[1].replace(/,/g, ''));
-      if (exemptM) result.exemptions    = exemptM[1].trim();
-      result.fetchMethod = 'html';
-      return result;
-    } catch (e) {
-      chDebug('[ClearHome] OCPA HTML fetch failed:', e.message);
-      return null;
-    }
-  };
-
-  const arcgisBase = 'https://vgispublic.ocpafl.org/server/rest/services';
-  const parcelLayers = [
-    `${arcgisBase}/Parcel_Public/FeatureServer/0`,
-    `${arcgisBase}/Nearby_Amenities_MIL1/FeatureServer/14`,
-    `${arcgisBase}/OCPA/Parcels/FeatureServer/0`
-  ];
-
-  const fromArcgisLayer = (layerUrl) => async (signal) => {
-    try {
-      const queryUrl = `${layerUrl}/query?` + new URLSearchParams({
-        where:     `PID='${pid}' OR PARNUM='${pid}' OR PIN='${pid}'`,
-        outFields: '*',
-        f:         'json',
-        resultRecordCount: 1
-      });
-      const res = await lookupFetch(queryUrl, {
-        headers: { 'Accept': 'application/json' }
-      }, signal);
-      if (!res.ok) return null;
-      const json = await res.json();
-      const feat = json?.features?.[0]?.attributes;
-      if (!feat) return null;
-
-      const result = base();
-      result.ownerName     = feat.NAME1 || feat.OWNER || feat.OWN_NAME || '';
-      result.assessedValue = feat.TOTAL_ASSD || feat.TOT_ASSD || feat.ASSD_VAL || 0;
-      result.marketValue   = feat.TOTAL_MKT  || feat.TOT_MKT  || feat.MKT_VAL  || 0;
-      result.landValue     = feat.LAND_MKT   || feat.LAND_VAL || 0;
-      result.buildingValue = feat.BLDG_MKT   || feat.BLDG_VAL || 0;
-      result.annualTax     = feat.TAXES || feat.TAX_AMT || 0;
-      result.yearBuiltCounty = feat.YR_BLT || feat.YEAR_BUILT || feat.ACT_YR_BLT || '';
-      result.sqftCounty    = feat.TOT_LVG_AR || feat.LIVG_AREA || feat.BLDG_SQFT || 0;
-      result.exemptions    = feat.EXMPT_DESC || feat.EXEMPTIONS || '';
-      result.landUse       = feat.DOR_DESC || feat.LAND_USE || '';
-      result.subdivision   = feat.SUB_DESC || feat.SUBDIV || '';
-      result.fetchMethod   = 'arcgis';
-      return result;
-    } catch (e) {
-      chDebug(`[ClearHome] ArcGIS layer failed (${layerUrl}):`, e.message);
-      return null;
-    }
-  };
-
-  const fromTaxEstimator = async (signal) => {
-    try {
-      const taxUrl = `https://taxestimator.ocpafl.org/Details.aspx?parcel=${pid}`;
-      const res = await lookupFetch(taxUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      }, signal);
-      if (!res.ok) return null;
-      const html = await res.text();
-      const assessM = html.match(/Assessed Value[^$]*\$?([\d,]+)/i);
-      const taxM    = html.match(/Ad Valorem[^$]*\$?([\d,]+)/i);
-      const ownerM  = html.match(/Owner[^:]*:\s*([^\n<]{4,60})/i);
-      if (!assessM && !taxM) return null;
-
-      const result = base();
-      if (assessM) result.assessedValue = parseFloat(assessM[1].replace(/,/g,''));
-      if (taxM)    result.annualTax     = parseFloat(taxM[1].replace(/,/g,''));
-      if (ownerM)  result.ownerName     = ownerM[1].trim();
-      result.fetchMethod = 'tax_estimator';
-      return result;
-    } catch (e) {
-      chDebug('[ClearHome] Tax estimator fetch failed:', e.message);
-      return null;
-    }
-  };
-
-  const found = await firstInOrder([fromParcelCard, ...parcelLayers.map(fromArcgisLayer), fromTaxEstimator]);
-  if (found) return found;
-
-  const result = base();
-  result.fetchMethod = 'failed';
-  result.manualUrl   = `https://www.ocpafl.org/Searches/ParcelSearch.aspx?parcel=${pid}`;
-  return result;
-}
-
-
-async function fetchAgentLicense(listingData) {
-  const { agentName, brokerageName, address } = listingData;
-  if (!agentName) return null;
-
-  const state = detectStateFromAddress(address);
-
-  const parts     = agentName.trim().split(/\s+/);
-  const firstName = (parts[0] || '').toUpperCase();
-  const lastName  = (parts[parts.length - 1] || '').toUpperCase();
-
-  if (state === 'FL' || state === 'Florida' || !state) {
-    const result = await lookupFLDBPR(firstName, lastName, agentName, brokerageName);
-    if (result) return result;
-  }
-
-  if (state === 'NY' || state === 'New York') {
-    const result = await lookupNYDOS(firstName, lastName);
-    if (result) return result;
-  }
-
-  const htmlResult = await lookupStateHTML(state, firstName, lastName, agentName);
-  if (htmlResult) return htmlResult;
-
-  return {
-    status:    'Unverified',
-    isActive:  null,
-    source:    'lookup_failed',
-    concerns:  [`Could not auto-verify license for ${state || 'unknown state'}`],
-    manualUrl: `https://www.arello.com/index.cfm?fm=search&firstName=${encodeURIComponent(parts[0]||'')}&lastName=${encodeURIComponent(lastName)}`,
-    stateUrl:  getStateLicenseLookupUrl(state, agentName)
-  };
-}
-
-async function lookupFLDBPR(firstName, lastName, agentName, brokerageName) {
-  const csvUrls = [
-    'https://www2.myfloridalicense.com/sto/file_download/extracts/REALESTATE2501LICENSE_1.csv',
-    'https://www2.myfloridalicense.com/sto/file_download/extracts/RE_rgn12.csv',
-    'https://www2.myfloridalicense.com/sto/file_download/extracts/RE_rgn14.csv',
-    'https://www2.myfloridalicense.com/sto/file_download/extracts/RE_rgn11.csv',
-  ];
-
-  for (const csvUrl of csvUrls) {
-    try {
-      const res = await lookupFetch(csvUrl, {
-        headers: { 'Accept': 'text/csv,text/plain,*/*', 'User-Agent': 'Mozilla/5.0' }
-      });
-      if (!res.ok) continue;
-
-      const text  = await res.text();
-      const lines = text.split('\n');
-      const matches = [];
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        if (!line.toUpperCase().includes(lastName)) continue;
-
-        const cols = parseCSVLine(line);
-        if (cols.length < 13) continue;
-
-
-        const nameCol      = (cols[1] || '').toUpperCase().trim();
-        const rank         = (cols[3] || '').trim();
-        const licNum       = (cols[11] || cols[17] || '').trim();
-        const primaryStatus = (cols[12] || '').trim();   
-        const activeStatus  = (cols[13] || '').trim();   
-        const issued        = (cols[14] || '').trim();
-        const expiry        = (cols[16] || '').trim();
-        const employer      = (cols[19] || '').trim();
-        const city          = (cols[7]  || '').trim();
-        const county        = (cols[10] || '').trim();
-
-        const nameParts = nameCol.includes(',')
-          ? { last: nameCol.split(',')[0].trim(), first: (nameCol.split(',')[1] || '').trim() }
-          : { last: nameCol.split(' ').pop(), first: nameCol.split(' ')[0] };
-
-        if (!nameParts.last.includes(lastName)) continue;
-        if (firstName && nameParts.first && !nameParts.first.includes(firstName)) continue;
-
-        matches.push({
-          fullName:      cols[1]?.trim() || agentName,
-          licenseType:   rank,
-          licenseNumber: licNum,
-          renewalStatus: primaryStatus,
-          activeStatus,
-          isActive:      activeStatus === 'Active' && primaryStatus === 'Current',
-          issued, expiry,
-          employer,
-          city, county,
-          source: 'FL DBPR (statewide CSV)',
-          csvUrl
-        });
-      }
-
-      if (!matches.length) continue;
-
-      const best = matches.find(m => /broker/i.test(m.licenseType) && m.fullName.toUpperCase().includes(firstName))
-                || matches.find(m => /broker/i.test(m.licenseType))
-                || matches.find(m => m.fullName.toUpperCase().includes(firstName))
-                || matches[0];
-
-      best.concerns = [];
-      if (best.renewalStatus && best.renewalStatus !== 'Current') {
-        best.concerns.push(`Renewal status: ${best.renewalStatus}`);
-      }
-      if (best.activeStatus && best.activeStatus !== 'Active') {
-        best.concerns.push(`License not active (${best.activeStatus})`);
-      }
-      if (best.expiry) {
-        const daysLeft = Math.floor((new Date(best.expiry) - new Date()) / 86400000);
-        if (daysLeft > 0 && daysLeft < 90) best.concerns.push(`Expires in ${daysLeft} days`);
-        if (daysLeft <= 0) best.concerns.push(`License EXPIRED on ${best.expiry}`);
-      }
-      if (brokerageName && best.employer && !best.employer.toUpperCase().includes(brokerageName.toUpperCase().slice(0,10))) {
-        best.concerns.push(`Employer on file (${best.employer}) differs from listing brokerage`);
-      }
-
-      return best;
-    } catch (e) {
-      chDebug('[ClearHome] FL DBPR fetch failed:', e.message);
-    }
-  }
-  return null;
-}
-
-async function lookupNYDOS(firstName, lastName) {
-  try {
-    const url = 'https://data.ny.gov/api/views/tested-csv-link/rows.csv?accessType=DOWNLOAD';
-    const searchUrl = `https://dos.ny.gov/licensing/lookup/licopen.asp?p_field=Name&p_value=${encodeURIComponent(lastName + ', ' + firstName)}&p_license_type=30&p_status=A`;
-    const res = await lookupFetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!res.ok) return null;
-    const html = await res.text();
-    const licNumM  = html.match(/([A-Z0-9]{8,12})/);
-    const statusM  = html.match(/(Active|Inactive|Expired)/i);
-    const expiryM  = html.match(/(\d{2}\/\d{2}\/\d{4})/);
-    if (licNumM) {
-      return {
-        fullName: `${firstName} ${lastName}`,
-        licenseNumber: licNumM[1],
-        activeStatus: statusM?.[1] || 'Unknown',
-        isActive: /active/i.test(statusM?.[1] || ''),
-        expiry: expiryM?.[1] || '',
-        source: 'NY DOS',
-        concerns: []
-      };
-    }
-  } catch (e) {
-    chDebug('[ClearHome] NY DOS lookup failed:', e.message);
-  }
-  return null;
-}
-
-async function lookupStateHTML(state, firstName, lastName, agentName) {
-  const stateUrls = {
-    'TX': `https://www.trec.texas.gov/apps/license-holder-search/?name=${encodeURIComponent(lastName + ' ' + firstName)}`,
-    'CA': `https://www2.dre.ca.gov/PublicASP/pplinfo.asp?License_id=`,
-    'GA': `https://verify.sos.ga.gov/verification/Search.aspx?facility=Y&skill=R1&district=N`,
-    'NC': `https://www.ncrec.gov/AgentSearch`,
-    'WA': `https://secure.lni.wa.gov/verify/Results.aspx?UBI=&LIC=&SAW=&firstName=${encodeURIComponent(firstName)}&lastName=${encodeURIComponent(lastName)}&Type=RE`,
-  };
-
-  const url = stateUrls[state];
-  if (!url) return null;
-
-  try {
-    const res = await lookupFetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!res.ok) return null;
-    const html = await res.text();
-    const activeM = html.match(/(Active|Current|Licensed)/i);
-    const licM    = html.match(/(?:License|Lic\.?)\s*#?\s*([A-Z0-9]{5,12})/i);
-    if (activeM || licM) {
-      return {
-        fullName: agentName,
-        licenseNumber: licM?.[1] || 'Found',
-        isActive: !!activeM,
-        activeStatus: activeM?.[1] || 'Found',
-        source: `${state} State License Board`,
-        concerns: []
-      };
-    }
-  } catch (e) {}
-  return null;
-}
-
 function detectStateFromAddress(address) {
   if (!address) return null;
   const stateZipM = address.match(/,\s*([A-Z]{2})\s+\d{5}/);
@@ -3397,8 +2903,24 @@ const CITY_TO_COUNTY = {
   'indianapolis,in':'IN|marion','detroit,mi':'MI|wayne','milwaukee,wi':'WI|milwaukee','kansas city,mo':'MO|jackson','st. louis,mo':'MO|st. louis city','saint louis,mo':'MO|st. louis city',
 };
 
-function resolveCountyTaxRate(address, stateAbbr) {
+function resolveCountyTaxRate(address, stateAbbr, countyName) {
   const NATIONAL_MEDIAN = 0.0090;
+  const stFromAddr = stateAbbr || (address || '').match(/,\s*([A-Z]{2})\s+\d{5}/)?.[1] || '';
+
+  // The listing's own county (Zillow names it on every listing) reaches the nationwide table;
+  // the address and city fallbacks below only cover addresses that spell out the county or a mapped city.
+  if (countyName && stFromAddr) {
+    const raw = String(countyName).toLowerCase().trim();
+    const base = raw.replace(/\s+(county|parish|borough|census area|municipality)$/, '').replace(/^(saint|st)\.?\s+/, 'st. ');
+    for (const name of [base, raw]) {
+      const rate = COUNTY_TAX_RATES[stFromAddr + '|' + name];
+      if (rate != null) {
+        const label = String(countyName).trim().replace(/\b\w/g, c => c.toUpperCase());
+        return { rate, label: /county|parish|borough|city|area|municipality/i.test(label) ? label : `${label} County`, source: 'listing county' };
+      }
+    }
+  }
+
   if (!address) {
     const sm = STATE_MEDIAN_TAX[stateAbbr];
     return sm ? { rate: sm, label: `${stateAbbr} state median`, source: 'state median' }
@@ -3453,80 +2975,6 @@ function getStateLicenseLookupUrl(state, agentName) {
   return urls[state] || `https://www.arello.com/index.cfm?fm=search&lastName=${encodeURIComponent((agentName||'').split(' ').pop())}`;
 }
 
-
-
-async function verifyMLS(listingData) {
-  const { mlsId, mlsSource, originatingMls } = listingData;
-  if (!mlsId) return null;
-
-  const stellarUrls = [
-    `https://www.stellarmls.com/property/${mlsId}`,
-    `https://www.stellarmls.com/listings/${mlsId}`,
-  ];
-
-  const fromStellar = (url) => async (signal) => {
-    try {
-      const res = await lookupFetch(url, {
-        headers: { 'Accept': 'text/html', 'User-Agent': 'Mozilla/5.0' }
-      }, signal);
-      if (!res.ok) return null;
-      const html = await res.text();
-
-      const statusM   = html.match(/(Active|Pending|Sold|Closed|Expired|Withdrawn|Back On Market)/i);
-      const listDateM = html.match(/(?:List Date|Date Listed|On Market)[:\s]+(\d{1,2}\/\d{1,2}\/\d{4})/i);
-      const agentIdM  = html.match(/(?:Agent MLS ID|Listing Agent ID)[:\s]+([A-Z0-9]{4,12})/i);
-      const priceM    = html.match(/(?:List Price|Asking)[:\s$]+([0-9,]+)/i);
-
-      if (!statusM) return null;
-      return {
-        status:     statusM[1],
-        listDate:   listDateM?.[1] || '',
-        agentMlsId: agentIdM?.[1]  || '',
-        listPrice:  priceM ? parseFloat(priceM[1].replace(/,/g,'')) : 0,
-        verified:   true,
-        source:     'Stellar MLS'
-      };
-    } catch (e) {
-      chDebug('[ClearHome] Stellar MLS fetch failed:', e.message);
-      return null;
-    }
-  };
-
-  const fromRealtor = async (signal) => {
-    try {
-      const url = `https://www.realtor.com/realestateandhomes-search/Winter-Garden_FL?mlsid=${mlsId}`;
-      const res = await lookupFetch(url, {
-        headers: { 'Accept': 'text/html', 'User-Agent': 'Mozilla/5.0' }
-      }, signal);
-      if (!res.ok) return null;
-      const html = await res.text();
-      const ndMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]+?)<\/script>/);
-      if (!ndMatch) return null;
-      const nd = JSON.parse(ndMatch[1]);
-      const listing = nd?.props?.pageProps?.properties?.[0];
-      if (!listing) return null;
-      return {
-        status:   listing.status || 'Active',
-        listDate: listing.list_date || '',
-        listPrice: listing.list_price || 0,
-        verified: true,
-        source:   'Realtor.com'
-      };
-    } catch(e) {
-      return null;
-    }
-  };
-
-  const found = await firstInOrder([...stellarUrls.map(fromStellar), fromRealtor]);
-  if (found) return found;
-
-  return {
-    status:   'Unverified',
-    verified: false,
-    source:   'lookup_failed',
-    note:     `Manual check: search MLS# ${mlsId} on your state MLS portal`
-  };
-}
 
 
 function estimateInsurance({ state, propertyType, price, yearBuilt, construction, hasHoa, zip, roofType, userOverride }) {
@@ -3653,26 +3101,6 @@ function estimateInsurance({ state, propertyType, price, yearBuilt, construction
     policyType,
     coverageAmount: Math.round(coverageAmount)
   };
-}
-
-function parseCSVLine(line) {
-  const result = [];
-  let current  = '';
-  let inQuotes = false;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (ch === '"') {
-      if (inQuotes && line[i+1] === '"') { current += '"'; i++; }
-      else inQuotes = !inQuotes;
-    } else if (ch === ',' && !inQuotes) {
-      result.push(current);
-      current = '';
-    } else {
-      current += ch;
-    }
-  }
-  result.push(current);
-  return result;
 }
 
 function buildMacroInterpretation(actualPct, expectedPct, excessPct, zestGapPct, origYear) {

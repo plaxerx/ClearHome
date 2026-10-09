@@ -151,7 +151,7 @@ function detectSite() {
   return 'Zillow';
 }
 
-async function scrapeListing({ allowPageFetch = true } = {}) {
+async function scrapeListing() {
   const site = detectSite();
   let data = {
     listingSite: site,
@@ -208,7 +208,7 @@ async function scrapeListing({ allowPageFetch = true } = {}) {
   };
 
   if (site === 'Zillow') {
-    data = await scrapeZillow(data, { allowPageFetch });
+    data = await scrapeZillow(data);
   } else if (site === 'Redfin') {
     data = scrapeRedfin(data);
   } else if (site === 'Realtor.com') {
@@ -883,6 +883,21 @@ function parseListedByFromText(text) {
   return { name, phone: pm ? `${pm[1]}-${pm[2]}-${pm[3]}` : '' };
 }
 
+// The listing agent's state license number as printed on the listing ("License #", "Lic.", or
+// California's "DRE #"). NMLS IDs belong to loan officers (Zillow's lender ads print them on the same
+// page), never to the listing agent, so text after "NMLS" is never taken.
+function chParseLicenseNumber(text) {
+  if (!text) return '';
+  const re = /(NMLS)?[\s#:]*(?:\b(?:Real Estate\s+)?Licen[cs]e|\bLic\.|\b(?:CA\s*)?DRE|\bBRE)\s*(?:#|No\.?|Number|ID)?\s*:?\s*#?\s*([A-Z]{0,4}[-\s]?\d[0-9A-Z-]{3,14})\b/gi;
+  for (const m of String(text).replace(/\u00A0/g, ' ').matchAll(re)) {
+    if (m[1]) continue;
+    const before = text.slice(Math.max(0, m.index - 12), m.index);
+    if (/NMLS/i.test(before)) continue;
+    return m[2].replace(/\s+/g, '').trim();
+  }
+  return '';
+}
+
 function captureListedByFromDOM() {
   try {
     _chAgentDebug = {};
@@ -1292,7 +1307,7 @@ function sortHistory(rows) {
   });
 }
 
-async function parsePriceHistoryFromPage({ allowPageFetch = true } = {}) {
+async function parsePriceHistoryFromPage() {
   const EVENT_KEYWORDS = [
     'Listed for sale','Listed for rent','Pending sale','Back on market',
     'Listing removed','Pre-foreclosure','Price change','Pending','Sold'
@@ -1348,7 +1363,7 @@ async function parsePriceHistoryFromPage({ allowPageFetch = true } = {}) {
     }
   } catch(e) {}
 
-  if (results.length > 0 || !allowPageFetch) return sortHistory(results);
+  if (results.length > 0) return sortHistory(results);
 
   try {
     const html = await fetch(window.location.href, {
@@ -1386,7 +1401,7 @@ async function parsePriceHistoryFromPage({ allowPageFetch = true } = {}) {
 
 
 
-async function scrapeZillow(data, { allowPageFetch = true } = {}) {
+async function scrapeZillow(data) {
   const fullText = extractFullPageText();
   const bodyInnerText = document.body.innerText || '';
 
@@ -1727,6 +1742,7 @@ async function scrapeZillow(data, { allowPageFetch = true } = {}) {
     data.taxAssessedValueListing = nd.resoFacts?.taxAssessedValue || 0;
     data.taxAnnualAmountListing  = nd.resoFacts?.taxAnnualAmount  || 0;
     data.taxYearListing          = nd.resoFacts?.taxYear          || '';
+    data.county                  = typeof nd.county === 'string' ? nd.county : '';
 
     const taxHist = nd.taxHistory || [];
     if (Array.isArray(taxHist)) {
@@ -1854,6 +1870,29 @@ async function scrapeZillow(data, { allowPageFetch = true } = {}) {
           if (pm2) data.agentPhone = `${pm2[1]}-${pm2[2]}-${pm2[3]}`;
         }
       }
+
+      // Zillow's attribution data first, then the printed attribution and "Listed by" text.
+      try {
+        const fromData = agent.agentLicenseNumber || agent.listingAgentLicenseNumber || agent.licenseNumber
+                      || agent.agentLicense || agent.listAgentStateLicense || '';
+        let lic = /^[A-Z0-9-]{4,20}$/i.test(String(fromData).trim()) ? String(fromData).trim() : '';
+        if (!lic) {
+          const ndRaw = document.getElementById('__NEXT_DATA__')?.textContent || '';
+          const ai = ndRaw.indexOf('"attributionInfo"');
+          if (ai >= 0) {
+            const lm = ndRaw.slice(ai, ai + 2500).match(/"(?:agentLicenseNumber|listingAgentLicenseNumber|listAgentStateLicense|agentLicense)"\s*:\s*"([A-Z0-9-]{4,20})"/i);
+            if (lm) lic = lm[1];
+          }
+        }
+        if (!lic) {
+          const attrEl = document.querySelector('[data-testid="attribution-LISTING_AGENT"]');
+          for (const src of [attrEl?.textContent || '', _chListedByBlock]) {
+            lic = chParseLicenseNumber(src);
+            if (lic) break;
+          }
+        }
+        if (lic) data.agentLicenseNumber = lic;
+      } catch (e) {}
 
       try {
         const ndTxt = document.getElementById('__NEXT_DATA__')?.textContent || '';
@@ -2421,7 +2460,7 @@ async function scrapeZillow(data, { allowPageFetch = true } = {}) {
   }
 
 
-  data.priceHistory = await parsePriceHistoryFromPage({ allowPageFetch });
+  data.priceHistory = await parsePriceHistoryFromPage();
 
   if (nd && data.priceHistory.length > 0) {
     const hasPrevSale = data.priceHistory.filter(h => /^sold$/i.test((h.event||'').trim())).length >= 2;
@@ -2497,13 +2536,6 @@ async function scrapeZillow(data, { allowPageFetch = true } = {}) {
     data.schools = data.nearbySchools.map(s => ({
       name: s.name, rating: s.rating, grades: s.grades || '', distance: s.distance || s.dist || ''
     }));
-  }
-
-  data.agentLicenseLookup = {
-    state: 'FL', name: data.agentName, brokerage: data.brokerageName, phone: data.agentPhone
-  };
-  if (data.parcelNumber) {
-    data.countyLookup = { county: 'Orange County, FL', parcel: data.parcelNumber };
   }
 
   if (!data.lastSoldPrice || data.lastSoldPrice === 0) {
@@ -3004,14 +3036,6 @@ async function runManualAnalysis() {
   lastAnalyzedUrl = '';
   analysisAbortKey++;
 
-  // Only feeds the lookup prefetch, which keys on parcel, agent, and MLS, never price history. Skipping
-  // the full-page refetch for an unrendered history table lets the prefetch start while the page scrolls.
-  const earlyScrapePromise = scrapeListing({ allowPageFetch: false }).catch(() => null);
-  earlyScrapePromise.then((earlyData) => {
-    if (!earlyData) return;
-    chrome.runtime.sendMessage({ type: 'PREFETCH_ANALYSIS_LOOKUPS', data: earlyData }).catch(() => {});
-  });
-
   setStatus('Opening up the full listing…');
   await expandPriceHistory();
 
@@ -3070,7 +3094,6 @@ const ACTIVITY_STEPS_BUY = [
   'Scraping listing details…',
   'Fetching tax records…',
   'Looking up comparable sales…',
-  'Verifying agent license…',
   'Running appreciation analysis…',
   'Generating buyer intelligence…',
 ];
@@ -3084,7 +3107,6 @@ const ACTIVITY_STEPS_RENT = [
   'Scraping rental details…',
   'Looking up Rent Zestimate…',
   'Checking landlord info…',
-  'Cross-checking owner of record…',
   'Generating rental intel…',
 ];
 function getActivitySteps(mode) {
@@ -3766,15 +3788,7 @@ function populatePanel(result, listingData) {
   if (listingData.isFSBO) {
     setBadge(shadow, '#ch-badge-agent', 'FSBO', 'warn');
   } else if (agv?.licenseStatus) {
-    if (agv.licenseStatus === 'Active' && !agv.concerns) {
-      setBadge(shadow, '#ch-badge-agent', 'No Concerns', 'ok');
-    } else if (agv.licenseStatus === 'Active' && agv.concerns) {
-      setBadge(shadow, '#ch-badge-agent', 'Concerns Found', 'warn');
-    } else if (agv.licenseStatus === 'Inactive') {
-      setBadge(shadow, '#ch-badge-agent', 'Inactive License', 'over');
-    } else {
-      setBadge(shadow, '#ch-badge-agent', agv.licenseStatus, 'warn');
-    }
+    setBadge(shadow, '#ch-badge-agent', agv.licenseStatus, 'warn');
   }
 
   const tldrEl   = shadow.querySelector('#ch-tldr-text');
@@ -4192,48 +4206,21 @@ function populatePanel(result, listingData) {
       <div class="ch-one-liner" style="border-left-color:var(--amber);margin-bottom:6px;">For Sale By Owner. Engage a buyer's agent or real estate attorney.</div>
     `;
   } else if (agvEl && agv) {
-    const renewBadge = agv.renewalStatus && agv.renewalStatus !== 'Current'
-      ? `<span class="ch-risk-badge ch-risk-badge--high" style="margin-left:6px;">${agv.renewalStatus}</span>` : '';
-    const employer = agv.employerOnFile || '';
+    const lookupLink = agv.licenseLookupUrl
+      ? `<a href="${agv.licenseLookupUrl}" target="_blank" rel="noopener" class="ch-comp-link">Verify with state board</a>` : '';
     const licLine = agv.licenseNumber
-      ? ` · <span class="ch-meta-lbl">License</span> ${agv.licenseNumber} (FL DBPR)${agv.expiry ? `, exp ${agv.expiry}` : ''}${employer ? ` · ${employer}` : ''}`
-      : '';
-    const licNum = agv.licenseNumber || '';
-    let recText = (agv.recommendation || '')
-      .replace(new RegExp(licNum.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '')
-      .replace(/License\s*#?\s*\d+/gi, '')
-      .replace(/no concerns?\s*(found)?/gi, '')
-      .replace(/proceed normally/gi, '')
-      .replace(/no further verification.*?required/gi, '')
-      .replace(/is active,?\s*current/gi, 'active')
-      .replace(/on file with/gi, 'with')
-      .replace(/under the FL DBPR/gi, '')
-      .replace(/\(SL[\s-]*(?:Sales Associate)?\)/gi, '')
-      .replace(/\(Sales Associate,?\s*FL DBPR\)/gi, '')
-      .replace(/\(SL-?\)/gi, '')
-      .replace(/SL Sales Associate/gi, 'Sales Associate')
-      .replace(/holds an active Florida Sales Associate license/gi, 'holds an active Sales Associate license')
-      .replace(/in FL DBPR records?/gi, '')
-      .replace(/with in /gi, 'with ')
-      .replace(/\s*[—–]\s*/g, ', ')
-      .replace(/;\s*and\s*/g, '; ')
-      .replace(/,\s*,/g, ',')
-      .replace(/\.\s*\./g, '.')
-      .replace(/\s+/g, ' ')
-      .replace(/^\s*[,.\s;]+/, '')
-      .trim();
-    if (recText.length < 10) recText = '';
+      ? ` · <span class="ch-meta-lbl">License</span> ${agv.licenseNumber}${lookupLink ? ` · ${lookupLink}` : ''}`
+      : (lookupLink ? ` · ${lookupLink}` : '');
+    const recText = (agv.recommendation || '').trim();
     agvEl.innerHTML = `
-      <div class="ch-agent-line"><strong>${agv.name || '—'}</strong>${agv.brokerage ? ` · ${agv.brokerage}` : ''}${agentPhone ? ` · ${agentPhone}` : ''}${renewBadge}</div>
+      <div class="ch-agent-line"><strong>${agv.name || '—'}</strong>${agv.brokerage ? ` · ${agv.brokerage}` : ''}${agentPhone ? ` · ${agentPhone}` : ''}</div>
       <div class="ch-agent-line">${agentMlsLine}${licLine}</div>
-      ${agv.concerns ? `<div class="ch-risk ch-risk--medium" style="margin-top:4px;"><div class="ch-risk-explanation">⚠ ${agv.concerns}</div></div>` : ''}
       ${recText ? `<div class="ch-rationale" style="margin-top:4px;">${recText}</div>` : ''}
     `;
   } else if (agvEl) {
     agvEl.innerHTML = `
       <div class="ch-agent-line"><strong>${listingData.agentName || '—'}</strong>${listingData.brokerageName ? ` · ${listingData.brokerageName}` : ''}${agentPhone ? ` · ${agentPhone}` : ''}</div>
-      ${agentMlsLine ? `<div class="ch-agent-line">${agentMlsLine}</div>` : ''}
-      <div class="ch-confidence" style="margin-top:4px;font-style:italic;">License verification available for FL agents via DBPR.</div>
+      ${(agentMlsLine || listingData.agentLicenseNumber) ? `<div class="ch-agent-line">${agentMlsLine}${listingData.agentLicenseNumber ? ` · <span class="ch-meta-lbl">License</span> ${listingData.agentLicenseNumber}` : ''}</div>` : ''}
     `;
   }
 

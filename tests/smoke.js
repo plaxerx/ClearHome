@@ -29,15 +29,19 @@ assert(content.includes("'Authorization': `Bearer ${apiKey}`"));
 assert(content.includes("response_format: { type: 'json_object' }"));
 assert(content.includes("service_tier: 'fast'"));
 assert(content.includes('readProviderStream'));
-assert(content.includes("type: 'PREFETCH_ANALYSIS_LOOKUPS'"));
 assert(content.includes("id=\"ch-rate-lab\""));
 assert(content.includes('calcPITIBreakdown(barPrice, Number(rate))'));
 
 assert(background.includes('insurancePct:         profile.insurancePct || 0'));
 assert(background.includes('result.taxEstimate.estimatedAfterReset = taxAtOffer;'),
   'tax badges/numbers must be recomputed on the Clear Home offer basis');
-assert(background.includes("msg.type === 'PREFETCH_ANALYSIS_LOOKUPS'"));
-assert(background.includes('getAnalysisLookupPromises(listingData)'));
+assert(!/ocpafl|stellarmls|Winter-Garden_FL|file_download\/extracts|lookupFLDBPR/i.test(background + content),
+  'no single-region public-record, license, or MLS lookups; analysis must work in every state');
+assert(!/\.csv['"`]/.test(background.replace(/fredgraph\.csv/g, '')), 'no CSV downloads at analysis time');
+assert(content.includes('chParseLicenseNumber'), 'listing agent license number must stay visible');
+assert(background.includes('agentLicenseNumber'), 'license number must reach the prompt and panel');
+assert(background.includes('getStateLicenseLookupUrl(propertyState, agentName)'), 'state board link for every state');
+assert(background.includes('resolveCountyTaxRate(address, propertyState, listingData.county)'));
 assert(background.includes('JS-OWNED OUTPUT FIELDS'));
 assert(search.includes('if (!filterActive) restoreMapPins();'));
 assert(search.includes("if (c.img) img.src = c.img;"));

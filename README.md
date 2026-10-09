@@ -57,7 +57,7 @@ Nothing currently, but you pay for the API calls. Nothing is sent until you clic
 | `manifest.json` | The extension manifest, at the repository root |
 | `sidepanel.html`, `sidepanel.js` | The side panel: every piece of interface you see and click |
 | `content.js` | Reads the Zillow page, calls your provider, and computes every number |
-| `background.js` | Builds the prompt, runs the offer, tax, and affordability engines, and fetches public records |
+| `background.js` | Builds the prompt and runs the offer, tax, and affordability engines |
 | `search.js` | The price-cut tools on Zillow search results |
 | `settings.html`, `settings.js` | Settings, shown inside the side panel |
 | `data/` | County property-tax rates |
@@ -71,7 +71,7 @@ It's a language model interpreting a sales listing. This is not an appraisal, a 
 
 - Zillow only for the full analysis. Redfin and Realtor are currently not finished.
 - The extension does a thorough manual capture of the Zillow listing utilizing the pop-up and html text alongside the underlying code. This causes the screen to scroll down automatically briefly to load the necessary text and then runs for about a minute or so to complete the analysis.
-- Agent license verification is Florida only right now, and it matches on name alone, so a common name can return the wrong licensee. Treat it as a prompt to check, not as proof.
+- Agent licenses are not verified automatically. The panel shows the license number when the listing prints one, and links to the state licensing board so you can check it yourself.
 - When too few similar homes are found, the comparison falls back to whatever nearby homes exist, and the offer price is only as good as those.
 - The county tax table is a 2026 snapshot.
 - Comps come from Zillow's nearby homes.
