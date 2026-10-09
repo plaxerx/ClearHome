@@ -151,7 +151,7 @@ function detectSite() {
   return 'Zillow';
 }
 
-async function scrapeListing() {
+async function scrapeListing({ allowPageFetch = true } = {}) {
   const site = detectSite();
   let data = {
     listingSite: site,
@@ -208,7 +208,7 @@ async function scrapeListing() {
   };
 
   if (site === 'Zillow') {
-    data = await scrapeZillow(data);
+    data = await scrapeZillow(data, { allowPageFetch });
   } else if (site === 'Redfin') {
     data = scrapeRedfin(data);
   } else if (site === 'Realtor.com') {
@@ -959,10 +959,15 @@ function expandPriceHistory() {
             || /^show more\b/i.test(txt);
       });
 
+  // Settled = 200ms without a mutation. An element that never stops mutating (a carousel, an ad slot)
+  // used to hold this open indefinitely, so it gives up after SETTLE_CAP_MS.
+  const SETTLE_CAP_MS = 1500;
   const waitForDOMSettled = () => new Promise(r => {
-    let t = setTimeout(() => { mo.disconnect(); r(); }, 400);
+    const done = () => { clearTimeout(t); clearTimeout(cap); mo.disconnect(); r(); };
+    let t = setTimeout(done, 400);
+    const cap = setTimeout(done, SETTLE_CAP_MS);
     const mo = new MutationObserver(() => {
-      clearTimeout(t); t = setTimeout(() => { mo.disconnect(); r(); }, 200);
+      clearTimeout(t); t = setTimeout(done, 200);
     });
     mo.observe(document.body, { childList: true, subtree: true });
   });
@@ -988,11 +993,16 @@ function expandPriceHistory() {
     await sleep(150);
 
     pushActivity('Expanding sections…');
+    // A button whose label survives its click used to be re-clicked until the 50-click budget ran out,
+    // and the sections after it never expanded. Each button now gets MAX_CLICKS_PER_BUTTON tries.
+    const MAX_CLICKS_PER_BUTTON = 3;
+    const clickCounts = new WeakMap();
     let clicks = 0;
     while (clicks < 50) {
-      const btns = findShowMoreButtons();
-      if (btns.length === 0) break;
-      try { btns[0].click(); } catch(e) {}
+      const btn = findShowMoreButtons().find(el => (clickCounts.get(el) || 0) < MAX_CLICKS_PER_BUTTON);
+      if (!btn) break;
+      clickCounts.set(btn, (clickCounts.get(btn) || 0) + 1);
+      try { btn.click(); } catch(e) {}
       await waitForDOMSettled();
       clicks++;
     }
@@ -1282,7 +1292,7 @@ function sortHistory(rows) {
   });
 }
 
-async function parsePriceHistoryFromPage() {
+async function parsePriceHistoryFromPage({ allowPageFetch = true } = {}) {
   const EVENT_KEYWORDS = [
     'Listed for sale','Listed for rent','Pending sale','Back on market',
     'Listing removed','Pre-foreclosure','Price change','Pending','Sold'
@@ -1338,7 +1348,7 @@ async function parsePriceHistoryFromPage() {
     }
   } catch(e) {}
 
-  if (results.length > 0) return sortHistory(results);
+  if (results.length > 0 || !allowPageFetch) return sortHistory(results);
 
   try {
     const html = await fetch(window.location.href, {
@@ -1376,7 +1386,7 @@ async function parsePriceHistoryFromPage() {
 
 
 
-async function scrapeZillow(data) {
+async function scrapeZillow(data, { allowPageFetch = true } = {}) {
   const fullText = extractFullPageText();
   const bodyInnerText = document.body.innerText || '';
 
@@ -2411,7 +2421,7 @@ async function scrapeZillow(data) {
   }
 
 
-  data.priceHistory = await parsePriceHistoryFromPage();
+  data.priceHistory = await parsePriceHistoryFromPage({ allowPageFetch });
 
   if (nd && data.priceHistory.length > 0) {
     const hasPrevSale = data.priceHistory.filter(h => /^sold$/i.test((h.event||'').trim())).length >= 2;
@@ -2994,7 +3004,9 @@ async function runManualAnalysis() {
   lastAnalyzedUrl = '';
   analysisAbortKey++;
 
-  const earlyScrapePromise = scrapeListing().catch(() => null);
+  // Only feeds the lookup prefetch, which keys on parcel, agent, and MLS, never price history. Skipping
+  // the full-page refetch for an unrendered history table lets the prefetch start while the page scrolls.
+  const earlyScrapePromise = scrapeListing({ allowPageFetch: false }).catch(() => null);
   earlyScrapePromise.then((earlyData) => {
     if (!earlyData) return;
     chrome.runtime.sendMessage({ type: 'PREFETCH_ANALYSIS_LOOKUPS', data: earlyData }).catch(() => {});

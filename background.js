@@ -1313,6 +1313,46 @@ function getAppreciationForDate(dateStr, msaKey) {
   return null;
 }
 
+// A public-record host that hangs instead of failing used to stall the prompt build, which waits on
+// these lookups and is abandoned by the content script after 30s. No request may hold it longer than this.
+const LOOKUP_FETCH_TIMEOUT_MS = 20000;
+const LOOKUP_DEADLINE_MS = 20000;
+
+// fetch() with the lookup timeout, also aborted by `signal` (firstInOrder cancelling a lower-priority source).
+// The timeout keeps running after headers arrive, so it bounds the body read too.
+function lookupFetch(url, init = {}, signal = null) {
+  const ctrl = new AbortController();
+  for (const s of [AbortSignal.timeout(LOOKUP_FETCH_TIMEOUT_MS), signal]) {
+    if (!s) continue;
+    if (s.aborted) ctrl.abort();
+    else s.addEventListener('abort', () => ctrl.abort(), { once: true });
+  }
+  return fetch(url, { ...init, signal: ctrl.signal });
+}
+
+// Starts every source at once and resolves with the first non-null result in list order, the same
+// answer a sequential try-each-in-turn loop gives, in the time of the slowest source it had to wait on
+// rather than the sum. Sources after the winner are aborted.
+function firstInOrder(tasks) {
+  const ctrls = tasks.map(() => new AbortController());
+  const runs = tasks.map((task, i) => Promise.resolve().then(() => task(ctrls[i].signal)).catch(() => null));
+  return (async () => {
+    for (let i = 0; i < runs.length; i++) {
+      const r = await runs[i];
+      if (r != null) { ctrls.slice(i + 1).forEach(c => c.abort()); return r; }
+    }
+    return null;
+  })();
+}
+
+function withDeadline(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise(r => { timer = setTimeout(() => r(null), ms); })
+  ]).finally(() => clearTimeout(timer));
+}
+
 const ANALYSIS_LOOKUP_TTL_MS = 10 * 60 * 1000;
 const analysisLookupCaches = {
   county: new Map(),
@@ -1368,8 +1408,13 @@ async function analyzeProperty(listingData, apiKey) {
   if (mode === 'sold') return analyzeSold(listingData, apiKey, TODAY, TODAY_ISO);
   if (mode === 'rent') return analyzeRent(listingData, apiKey, TODAY, TODAY_ISO);
 
+  // Neither depends on the record lookups, so they run alongside them instead of after.
+  const mortgageRatePromise = getMortgageRate().catch(() => null);
+  const commutePromise = fetchCommuteEstimates(listingData.address, listingData.userProfile?.commuteAddrs || {});
+
+  // A lookup still running at the deadline is treated as not found; it keeps going and lands in the cache.
   const [countyResult, agentResult, mlsResult] = await Promise.allSettled(
-    getAnalysisLookupPromises(listingData)
+    getAnalysisLookupPromises(listingData).map(p => withDeadline(p, LOOKUP_DEADLINE_MS))
   );
 
   const county = countyResult.status === 'fulfilled' ? countyResult.value : null;
@@ -1674,7 +1719,7 @@ async function analyzeProperty(listingData, apiKey) {
   const downPct        = (profile.downPaymentPct  || 20) / 100;
   let defaultRate = 7.0;
   try {
-    const fredRate = await getMortgageRate();
+    const fredRate = await mortgageRatePromise;
     if (fredRate && fredRate > 0) defaultRate = Math.round((fredRate + 0.125) * 1000) / 1000;
   } catch (e) {}
   const userRate       = parseFloat(profile.mortgageRatePct);
@@ -1685,7 +1730,6 @@ async function analyzeProperty(listingData, apiKey) {
   const monthlyDebts   = profile.monthlyDebts      || 0;
   const monthlyTakehome = profile.monthlyTakehome  || 0;
   const prefs          = profile.prefs             || {};
-  const commuteAddrs   = profile.commuteAddrs      || {};
   const priceCheckMode = prefs.priceCheckMode      || 'fair_value';
   const offerStrategy  = prefs.offerStrategy       || 'competitive';
   const floodInsurance = prefs.floodInsurance      || false;
@@ -1694,8 +1738,6 @@ async function analyzeProperty(listingData, apiKey) {
   const priorityStr = priorities.length > 0
     ? `Buyer priorities (INCREASE risk severity for these): ${priorities.join(', ')}`
     : 'No priorities set';
-
-  const commutePromise = fetchCommuteEstimates(listingData.address, commuteAddrs);
 
   const isInvestmentMode = priorities.includes('investment');
   let investCashFlowBlock = '';
@@ -2917,7 +2959,7 @@ async function geocodeAddress(addressStr) {
 
   try {
     const q = encodeURIComponent(addressStr.trim());
-    const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${q}&format=json&limit=1`, {
+    const res = await lookupFetch(`https://nominatim.openstreetmap.org/search?q=${q}&format=json&limit=1`, {
       headers: { 'User-Agent': 'ClearHome/1.2 (real-estate-extension)' }
     });
     const data = await res.json();
@@ -2932,7 +2974,7 @@ async function geocodeAddress(addressStr) {
 async function fetchOSRMRoute(fromCoords, toCoords) {
   try {
     const url = `https://router.project-osrm.org/route/v1/driving/${fromCoords.lon},${fromCoords.lat};${toCoords.lon},${toCoords.lat}?overview=false`;
-    const res  = await fetch(url);
+    const res  = await lookupFetch(url);
     const data = await res.json();
     if (data.code !== 'Ok' || !data.routes?.length) return null;
     const minutes = data.routes[0].duration / 60;
@@ -2993,17 +3035,18 @@ async function fetchCountyData(listingData) {
   if (!parcelNumber) return null;
 
   const pid = parcelNumber.replace(/[^0-9A-Z]/gi, '');
-  const result = { source: 'Orange County PA', parcel: pid };
+  const base = () => ({ source: 'Orange County PA', parcel: pid });
 
-  try {
-    const cardUrl = `https://www.ocpafl.org/Searches/ParcelSearch.aspx?parcel=${pid}`;
-    const res = await fetch(cardUrl, {
-      headers: {
-        'Accept': 'text/html,application/xhtml+xml',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      }
-    });
-    if (res.ok) {
+  const fromParcelCard = async (signal) => {
+    try {
+      const cardUrl = `https://www.ocpafl.org/Searches/ParcelSearch.aspx?parcel=${pid}`;
+      const res = await lookupFetch(cardUrl, {
+        headers: {
+          'Accept': 'text/html,application/xhtml+xml',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+      }, signal);
+      if (!res.ok) return null;
       const html = await res.text();
       const ownerM    = html.match(/(?:Owner|NAME1)["\s:]+([^"<\n]{3,60})/i);
       const assessM   = html.match(/(?:Total Assessed|TOTAL_ASSD)["\s:$]+([0-9,]+)/i);
@@ -3012,22 +3055,23 @@ async function fetchCountyData(listingData) {
       const yearM     = html.match(/(?:Year Built|YR_BLT)["\s:]+(\d{4})/i);
       const sqftM     = html.match(/(?:Living Area|TOT_LVG_AR|Sq\.?\s*Ft)["\s:]+([0-9,]+)/i);
       const exemptM   = html.match(/(?:Exemption|EXMPT)["\s:]+([^"<\n]{2,40})/i);
+      if (!ownerM && !assessM) return null;
 
-      if (ownerM || assessM) {
-        if (ownerM)  result.ownerName     = ownerM[1].trim();
-        if (assessM) result.assessedValue = parseFloat(assessM[1].replace(/,/g, ''));
-        if (marketM) result.marketValue   = parseFloat(marketM[1].replace(/,/g, ''));
-        if (taxM)    result.annualTax     = parseFloat(taxM[1].replace(/,/g, ''));
-        if (yearM)   result.yearBuiltCounty = yearM[1];
-        if (sqftM)   result.sqftCounty    = parseFloat(sqftM[1].replace(/,/g, ''));
-        if (exemptM) result.exemptions    = exemptM[1].trim();
-        result.fetchMethod = 'html';
-        return result;
-      }
+      const result = base();
+      if (ownerM)  result.ownerName     = ownerM[1].trim();
+      if (assessM) result.assessedValue = parseFloat(assessM[1].replace(/,/g, ''));
+      if (marketM) result.marketValue   = parseFloat(marketM[1].replace(/,/g, ''));
+      if (taxM)    result.annualTax     = parseFloat(taxM[1].replace(/,/g, ''));
+      if (yearM)   result.yearBuiltCounty = yearM[1];
+      if (sqftM)   result.sqftCounty    = parseFloat(sqftM[1].replace(/,/g, ''));
+      if (exemptM) result.exemptions    = exemptM[1].trim();
+      result.fetchMethod = 'html';
+      return result;
+    } catch (e) {
+      chDebug('[ClearHome] OCPA HTML fetch failed:', e.message);
+      return null;
     }
-  } catch (e) {
-    chDebug('[ClearHome] OCPA HTML fetch failed:', e.message);
-  }
+  };
 
   const arcgisBase = 'https://vgispublic.ocpafl.org/server/rest/services';
   const parcelLayers = [
@@ -3036,7 +3080,7 @@ async function fetchCountyData(listingData) {
     `${arcgisBase}/OCPA/Parcels/FeatureServer/0`
   ];
 
-  for (const layerUrl of parcelLayers) {
+  const fromArcgisLayer = (layerUrl) => async (signal) => {
     try {
       const queryUrl = `${layerUrl}/query?` + new URLSearchParams({
         where:     `PID='${pid}' OR PARNUM='${pid}' OR PIN='${pid}'`,
@@ -3044,14 +3088,15 @@ async function fetchCountyData(listingData) {
         f:         'json',
         resultRecordCount: 1
       });
-      const res = await fetch(queryUrl, {
+      const res = await lookupFetch(queryUrl, {
         headers: { 'Accept': 'application/json' }
-      });
-      if (!res.ok) continue;
+      }, signal);
+      if (!res.ok) return null;
       const json = await res.json();
       const feat = json?.features?.[0]?.attributes;
-      if (!feat) continue;
+      if (!feat) return null;
 
+      const result = base();
       result.ownerName     = feat.NAME1 || feat.OWNER || feat.OWN_NAME || '';
       result.assessedValue = feat.TOTAL_ASSD || feat.TOT_ASSD || feat.ASSD_VAL || 0;
       result.marketValue   = feat.TOTAL_MKT  || feat.TOT_MKT  || feat.MKT_VAL  || 0;
@@ -3067,31 +3112,39 @@ async function fetchCountyData(listingData) {
       return result;
     } catch (e) {
       chDebug(`[ClearHome] ArcGIS layer failed (${layerUrl}):`, e.message);
+      return null;
     }
-  }
+  };
 
-  try {
-    const taxUrl = `https://taxestimator.ocpafl.org/Details.aspx?parcel=${pid}`;
-    const res = await fetch(taxUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
-    if (res.ok) {
+  const fromTaxEstimator = async (signal) => {
+    try {
+      const taxUrl = `https://taxestimator.ocpafl.org/Details.aspx?parcel=${pid}`;
+      const res = await lookupFetch(taxUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      }, signal);
+      if (!res.ok) return null;
       const html = await res.text();
       const assessM = html.match(/Assessed Value[^$]*\$?([\d,]+)/i);
       const taxM    = html.match(/Ad Valorem[^$]*\$?([\d,]+)/i);
       const ownerM  = html.match(/Owner[^:]*:\s*([^\n<]{4,60})/i);
-      if (assessM || taxM) {
-        if (assessM) result.assessedValue = parseFloat(assessM[1].replace(/,/g,''));
-        if (taxM)    result.annualTax     = parseFloat(taxM[1].replace(/,/g,''));
-        if (ownerM)  result.ownerName     = ownerM[1].trim();
-        result.fetchMethod = 'tax_estimator';
-        return result;
-      }
-    }
-  } catch (e) {
-    chDebug('[ClearHome] Tax estimator fetch failed:', e.message);
-  }
+      if (!assessM && !taxM) return null;
 
+      const result = base();
+      if (assessM) result.assessedValue = parseFloat(assessM[1].replace(/,/g,''));
+      if (taxM)    result.annualTax     = parseFloat(taxM[1].replace(/,/g,''));
+      if (ownerM)  result.ownerName     = ownerM[1].trim();
+      result.fetchMethod = 'tax_estimator';
+      return result;
+    } catch (e) {
+      chDebug('[ClearHome] Tax estimator fetch failed:', e.message);
+      return null;
+    }
+  };
+
+  const found = await firstInOrder([fromParcelCard, ...parcelLayers.map(fromArcgisLayer), fromTaxEstimator]);
+  if (found) return found;
+
+  const result = base();
   result.fetchMethod = 'failed';
   result.manualUrl   = `https://www.ocpafl.org/Searches/ParcelSearch.aspx?parcel=${pid}`;
   return result;
@@ -3141,7 +3194,7 @@ async function lookupFLDBPR(firstName, lastName, agentName, brokerageName) {
 
   for (const csvUrl of csvUrls) {
     try {
-      const res = await fetch(csvUrl, {
+      const res = await lookupFetch(csvUrl, {
         headers: { 'Accept': 'text/csv,text/plain,*/*', 'User-Agent': 'Mozilla/5.0' }
       });
       if (!res.ok) continue;
@@ -3226,7 +3279,7 @@ async function lookupNYDOS(firstName, lastName) {
   try {
     const url = 'https://data.ny.gov/api/views/tested-csv-link/rows.csv?accessType=DOWNLOAD';
     const searchUrl = `https://dos.ny.gov/licensing/lookup/licopen.asp?p_field=Name&p_value=${encodeURIComponent(lastName + ', ' + firstName)}&p_license_type=30&p_status=A`;
-    const res = await fetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const res = await lookupFetch(searchUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!res.ok) return null;
     const html = await res.text();
     const licNumM  = html.match(/([A-Z0-9]{8,12})/);
@@ -3262,7 +3315,7 @@ async function lookupStateHTML(state, firstName, lastName, agentName) {
   if (!url) return null;
 
   try {
-    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const res = await lookupFetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     if (!res.ok) return null;
     const html = await res.text();
     const activeM = html.match(/(Active|Current|Licensed)/i);
@@ -3411,12 +3464,12 @@ async function verifyMLS(listingData) {
     `https://www.stellarmls.com/listings/${mlsId}`,
   ];
 
-  for (const url of stellarUrls) {
+  const fromStellar = (url) => async (signal) => {
     try {
-      const res = await fetch(url, {
+      const res = await lookupFetch(url, {
         headers: { 'Accept': 'text/html', 'User-Agent': 'Mozilla/5.0' }
-      });
-      if (!res.ok) continue;
+      }, signal);
+      if (!res.ok) return null;
       const html = await res.text();
 
       const statusM   = html.match(/(Active|Pending|Sold|Closed|Expired|Withdrawn|Back On Market)/i);
@@ -3424,48 +3477,48 @@ async function verifyMLS(listingData) {
       const agentIdM  = html.match(/(?:Agent MLS ID|Listing Agent ID)[:\s]+([A-Z0-9]{4,12})/i);
       const priceM    = html.match(/(?:List Price|Asking)[:\s$]+([0-9,]+)/i);
 
-      if (statusM) {
-        return {
-          status:     statusM[1],
-          listDate:   listDateM?.[1] || '',
-          agentMlsId: agentIdM?.[1]  || '',
-          listPrice:  priceM ? parseFloat(priceM[1].replace(/,/g,'')) : 0,
-          verified:   true,
-          source:     'Stellar MLS'
-        };
-      }
+      if (!statusM) return null;
+      return {
+        status:     statusM[1],
+        listDate:   listDateM?.[1] || '',
+        agentMlsId: agentIdM?.[1]  || '',
+        listPrice:  priceM ? parseFloat(priceM[1].replace(/,/g,'')) : 0,
+        verified:   true,
+        source:     'Stellar MLS'
+      };
     } catch (e) {
       chDebug('[ClearHome] Stellar MLS fetch failed:', e.message);
+      return null;
     }
-  }
+  };
 
-  try {
-    const url = `https://www.floridarealtors.org/research-and-statistics/housing-data`;
-  } catch(e) {}
-
-  try {
-    const url = `https://www.realtor.com/realestateandhomes-search/Winter-Garden_FL?mlsid=${mlsId}`;
-    const res = await fetch(url, {
-      headers: { 'Accept': 'text/html', 'User-Agent': 'Mozilla/5.0' }
-    });
-    if (res.ok) {
+  const fromRealtor = async (signal) => {
+    try {
+      const url = `https://www.realtor.com/realestateandhomes-search/Winter-Garden_FL?mlsid=${mlsId}`;
+      const res = await lookupFetch(url, {
+        headers: { 'Accept': 'text/html', 'User-Agent': 'Mozilla/5.0' }
+      }, signal);
+      if (!res.ok) return null;
       const html = await res.text();
       const ndMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]+?)<\/script>/);
-      if (ndMatch) {
-        const nd = JSON.parse(ndMatch[1]);
-        const listing = nd?.props?.pageProps?.properties?.[0];
-        if (listing) {
-          return {
-            status:   listing.status || 'Active',
-            listDate: listing.list_date || '',
-            listPrice: listing.list_price || 0,
-            verified: true,
-            source:   'Realtor.com'
-          };
-        }
-      }
+      if (!ndMatch) return null;
+      const nd = JSON.parse(ndMatch[1]);
+      const listing = nd?.props?.pageProps?.properties?.[0];
+      if (!listing) return null;
+      return {
+        status:   listing.status || 'Active',
+        listDate: listing.list_date || '',
+        listPrice: listing.list_price || 0,
+        verified: true,
+        source:   'Realtor.com'
+      };
+    } catch(e) {
+      return null;
     }
-  } catch(e) {}
+  };
+
+  const found = await firstInOrder([...stellarUrls.map(fromStellar), fromRealtor]);
+  if (found) return found;
 
   return {
     status:   'Unverified',
